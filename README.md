@@ -1,7 +1,15 @@
 # FamilyFriend
  Audio and image censoring for livestreaming
 
+## 🛠️ Pré-requisitos
+
+Se você estiver usando Linux, será necessário instalar a biblioteca PortAudio no sistema antes de rodar o projeto:
+
+```bash
+sudo apt update
+sudo apt install libportaudio2 portaudio19-dev
  
+
 TODO:
 
 Entrada:
