@@ -1,4 +1,8 @@
 import os
+import string
+import transformers
+
+transformers.logging.set_verbosity_error()
 # Desativa as proteções de segurança recentes para permitir o carregamento do modelo antigo
 os.environ["TORCH_LOAD_IS_SAFE"] = "True"
 os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
@@ -17,7 +21,6 @@ class ToxicCensor:
         self.classifier = pipeline(
             "text-classification", 
             model="unitary/unbiased-toxic-roberta",
-            # Puxa os safetensors do commit de conversão que ainda não teve merge
             revision="refs/pr/4", 
             top_k=None, 
             device=device,
@@ -37,17 +40,17 @@ class ToxicCensor:
         sentence_scores = self.classifier(full_text)[0]
         scores_dict = {score['label']: score['score'] for score in sentence_scores}
         
-        # Categorias que você quer censurar (ignoramos o 'toxic' genérico)
-        target_labels = ['obscene', 'insult', 'identity_hate', 'severe_toxic']
+        # Categorias que você quer censurar
+        # Dica: Remova 'insult' se não quiser censurar 'stupid', 'idiot', etc.
+        target_labels = ['obscene', 'identity_hate', 'severe_toxic', 'insult']
         
-        # Se a frase não bater em nenhuma das categorias pesadas, libera o áudio
         if not any(scores_dict.get(label, 0) > self.threshold for label in target_labels):
             return []
             
         intervals_to_censor = []
         
         for w_info in words_list:
-            clean_word = w_info["word"].strip()
+            clean_word = w_info["word"].strip(string.punctuation + " \t\n\r")
             
             if len(clean_word) < 2:
                 continue
@@ -55,12 +58,24 @@ class ToxicCensor:
             word_score = self.classifier(clean_word)[0]
             w_scores_dict = {s['label']: s['score'] for s in word_score}
             
-            # Checa se a palavra específica bate nas categorias
-            if any(w_scores_dict.get(label, 0) > self.threshold for label in target_labels):
+            # Filtra apenas as labels que passaram do limiar de censura
+            triggered_labels = {
+                label: w_scores_dict.get(label, 0) 
+                for label in target_labels 
+                if w_scores_dict.get(label, 0) > self.threshold
+            }
+            
+            if triggered_labels:
+                # Encontra qual foi a categoria com a maior pontuação para essa palavra
+                top_label = max(triggered_labels, key=triggered_labels.get)
+                top_score = triggered_labels[top_label]
+                
                 intervals_to_censor.append({
                     "start": w_info["start"],
                     "end": w_info["end"],
-                    "word": clean_word
+                    "word": clean_word,
+                    "label": top_label, # <--- AQUI ESTÁ A LABEL
+                    "score": top_score
                 })
                 
         return intervals_to_censor
@@ -69,10 +84,8 @@ class ToxicCensor:
 # Teste isolado do módulo
 # ==========================================
 if __name__ == "__main__":
-    # Inicializa o censor
     censor = ToxicCensor(threshold=0.5)
     
-    # Simula a saída do seu script audio_recording.py (Faster-Whisper)
     mock_whisper_output = [
         {"word": "Hey", "start": 0.0, "end": 0.3},
         {"word": "you", "start": 0.3, "end": 0.5},
@@ -85,13 +98,12 @@ if __name__ == "__main__":
     print("\nSimulando entrada do Whisper:")
     print("Frase gerada: 'Hey you fucking idiot stop talking'")
     
-    # Roda a detecção
     toxic_intervals = censor.detect_toxic_words(mock_whisper_output)
     
     print("\nResultados do Censor:")
     if toxic_intervals:
         for item in toxic_intervals:
-            print(f"🚨 Bipar: '{item['word']}' de {item['start']}s até {item['end']}s")
+            print(f"🚨 Bipar: '{item['word']}' [{item['label']} - {(item['score']*100):.1f}%] de {item['start']}s até {item['end']}s")
     else:
         print("Tudo limpo, nenhum bip necessário.")
 

@@ -40,8 +40,8 @@ def main():
     # MUDANÇA AQUI: Usando modelo em Inglês, CUDA e FP16
     # ---------------------------------------------------------
     print("🤖 Carregando o modelo Faster-Whisper (Medium.en na GPU)...")
-    # Tente "small.en" primeiro. Se quiser ainda mais precisão e o RTF continuar < 1, suba para "medium.en"
-    model = WhisperModel("medium.en", device="cuda", compute_type="float16")
+    # Tente "small.en" primeiro. Se quiser ainda mais precisão e o RTF continuar < 1, suba para "large.en"
+    model = WhisperModel("large-v3", device="cuda", compute_type="float16", vad_filter=True)
     print("✅ Modelo carregado com sucesso!\n")
 
     chunker_thread = threading.Thread(target=chunking_worker, daemon=True)
@@ -63,7 +63,8 @@ def main():
                     audio_data, 
                     language="en",        # <--- Forçando o idioma para Inglês
                     word_timestamps=True, 
-                    beam_size=5           # Na 4080 podemos usar 5 (padrão) para melhor precisão sem lag
+                    beam_size=5,         # Na 4080 podemos usar 5 (padrão) para melhor precisão sem lag
+                    condition_on_previous_text=False
                 )
                 
                 words_found = []

@@ -1,28 +1,24 @@
 import numpy as np
 
+import numpy as np
+
 class AudioCensor:
-    def __init__(self, sample_rate=16000, beep_freq=1000.0, overlap_duration=0.5):
+    def __init__(self, sample_rate=16000, beep_freq=1000.0, overlap_duration=0.5, beep_margin_start=0.1, beep_margin_end=0.25):
         """
-        Inicializa o processador de censura de áudio.
-        beep_freq: 1000Hz é a frequência padrão do bip de censura da TV.
-        overlap_duration: Tempo que precisará ser cortado do início do chunk final.
+        beep_margin_start: 0.1s (100ms) antes da palavra.
+        beep_margin_end: 0.25s (250ms) depois da palavra, para cobrir o "rastro" da pronúncia.
         """
         self.sample_rate = sample_rate
         self.beep_freq = beep_freq
         self.overlap_samples = int(overlap_duration * sample_rate)
+        self.beep_margin_start = beep_margin_start
+        self.beep_margin_end = beep_margin_end
 
     def _generate_beep(self, duration):
-        """
-        Gera a onda senoidal do bip.
-        Inclui um micro fade-in e fade-out (10ms) nas pontas do bip para evitar
-        o efeito de 'clipping' (estalos secos) quando o áudio da voz é cortado abruptamente.
-        """
         t = np.linspace(0, duration, int(self.sample_rate * duration), False)
-        # Amplitude de 0.5 para o bip não estourar os alto-falantes do usuário
         beep = 0.5 * np.sin(self.beep_freq * t * 2 * np.pi)
         
-        # Suavização de bordas (Envelope)
-        fade_duration = int(self.sample_rate * 0.01) # 10 milissegundos
+        fade_duration = int(self.sample_rate * 0.01)
         if len(beep) > 2 * fade_duration:
             fade_in = np.linspace(0, 1, fade_duration)
             fade_out = np.linspace(1, 0, fade_duration)
@@ -31,20 +27,14 @@ class AudioCensor:
             
         return beep.astype(np.float32)
 
-    def process_chunk(self, audio_chunk, toxic_intervals):
-        """
-        Recebe o array do chunk inteiro (3.0s) e os tempos ofensivos.
-        Substitui as ofensas por bips e DEPOIS corta o overlap, conforme sua especificação.
-        """
-        # Trabalhamos em uma cópia para não alterar o buffer original acidentalmente
+    def process_chunk(self, audio_chunk, toxic_intervals, is_first_chunk=False):
         censored_chunk = audio_chunk.copy()
         chunk_duration = len(audio_chunk) / self.sample_rate
         
-        # 1. Aplica a censura nos tempos exatos
         for interval in toxic_intervals:
-            # Garante que os tempos não ultrapassem os limites físicos do chunk
-            start_time = max(0.0, interval["start"])
-            end_time = min(chunk_duration, interval["end"])
+            # Aplica margens independentes para o início e para o fim
+            start_time = max(0.0, interval["start"] - self.beep_margin_start)
+            end_time = min(chunk_duration, interval["end"] + self.beep_margin_end)
             
             if start_time >= end_time:
                 continue
@@ -55,15 +45,14 @@ class AudioCensor:
             
             beep = self._generate_beep(duration)
             
-            # Ajuste de tamanho para evitar erro de indexação por arredondamento
             max_len = min(len(beep), end_idx - start_idx)
             censored_chunk[start_idx:start_idx+max_len] = beep[:max_len]
             
-        # 2. Corta o Overlap
-        # Como especificado: "antes de usar o chunk tem que cortar a parte de overlap"
-        # Isso garante que a parte final do bip do chunk anterior não seja tocada duas vezes
-        final_output = censored_chunk[self.overlap_samples:]
-        
+        if not is_first_chunk:
+            final_output = censored_chunk[self.overlap_samples:]
+        else:
+            final_output = censored_chunk
+            
         return final_output
 
 # ==========================================
