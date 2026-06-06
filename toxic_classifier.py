@@ -33,51 +33,58 @@ class ToxicCensor:
         if not words_list:
             return []
 
-        full_text = " ".join([w["word"] for w in words_list]).strip()
-        if not full_text:
-            return []
-            
-        sentence_scores = self.classifier(full_text)[0]
-        scores_dict = {score['label']: score['score'] for score in sentence_scores}
-        
-        # Categorias que você quer censurar
-        # Dica: Remova 'insult' se não quiser censurar 'stupid', 'idiot', etc.
         target_labels = ['obscene', 'identity_hate', 'severe_toxic', 'insult']
-        
-        if not any(scores_dict.get(label, 0) > self.threshold for label in target_labels):
-            return []
-            
         intervals_to_censor = []
         
-        for w_info in words_list:
-            clean_word = w_info["word"].strip(string.punctuation + " \t\n\r")
+        # Parâmetro de segurança para chunking (200 palavras garantem que não passaremos de 512 tokens na GPU)
+        CHUNK_SIZE = 200
+
+        # Divide a lista de palavras recebida em lotes menores
+        for i in range(0, len(words_list), CHUNK_SIZE):
+            chunk_words = words_list[i:i + CHUNK_SIZE]
+            full_text = " ".join([w["word"] for w in chunk_words]).strip()
+
+            if not full_text:
+                continue
+
+            # Avalia a frase inteira do lote atual. 
+            # Mantemos o truncation=True apenas como última linha de defesa à prova de falhas.
+            sentence_scores = self.classifier(full_text, truncation=True, max_length=512)[0]
+            scores_dict = {score['label']: score['score'] for score in sentence_scores}
             
-            if len(clean_word) < 2:
+            # Se o lote inteiro for limpo, pula a verificação palavra por palavra (Otimização de GPU)
+            if not any(scores_dict.get(label, 0) > self.threshold for label in target_labels):
                 continue
                 
-            word_score = self.classifier(clean_word)[0]
-            w_scores_dict = {s['label']: s['score'] for s in word_score}
-            
-            # Filtra apenas as labels que passaram do limiar de censura
-            triggered_labels = {
-                label: w_scores_dict.get(label, 0) 
-                for label in target_labels 
-                if w_scores_dict.get(label, 0) > self.threshold
-            }
-            
-            if triggered_labels:
-                # Encontra qual foi a categoria com a maior pontuação para essa palavra
-                top_label = max(triggered_labels, key=triggered_labels.get)
-                top_score = triggered_labels[top_label]
+            # Se a IA detectou toxicidade no lote, investiga palavra por palavra dentro desse pedaço
+            for w_info in chunk_words:
+                clean_word = w_info["word"].strip(string.punctuation + " \t\n\r")
                 
-                intervals_to_censor.append({
-                    "start": w_info["start"],
-                    "end": w_info["end"],
-                    "word": clean_word,
-                    "label": top_label, # <--- AQUI ESTÁ A LABEL
-                    "score": top_score
-                })
+                if len(clean_word) < 2:
+                    continue
+                    
+                word_score = self.classifier(clean_word, truncation=True, max_length=512)[0]
+                w_scores_dict = {s['label']: s['score'] for s in word_score}
                 
+                triggered_labels = {
+                    label: w_scores_dict.get(label, 0) 
+                    for label in target_labels 
+                    if w_scores_dict.get(label, 0) > self.threshold
+                }
+                
+                if triggered_labels:
+                    top_label = max(triggered_labels, key=triggered_labels.get)
+                    top_score = triggered_labels[top_label]
+                    
+                    result_item = w_info.copy()
+                    result_item.update({
+                        "word": clean_word,
+                        "label": top_label,
+                        "score": top_score
+                    })
+                    
+                    intervals_to_censor.append(result_item)
+                    
         return intervals_to_censor
 
 # ==========================================
