@@ -23,7 +23,7 @@ echo "Fixando a versão do Python estritamente no 3.12..."
 uv python pin 3.12
 
 echo "Adicionando dependências do projeto e montando a venv..."
-uv add sounddevice numpy faster-whisper transformers
+uv add sounddevice numpy faster-whisper transformers soundfile
 
 echo "Injetando PyTorch otimizado para GPU (CUDA 12.1)..."
 # Injetamos no final para garantir que o uv não destrua a venv depois

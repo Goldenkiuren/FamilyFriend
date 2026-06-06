@@ -4,7 +4,9 @@ import threading
 import wave
 import numpy as np
 import sounddevice as sd
+import soundfile as sf
 import customtkinter as ctk
+from tkinter import filedialog
 from faster_whisper import WhisperModel
 
 from toxic_classifier import ToxicCensor
@@ -29,13 +31,31 @@ output_audio_queue = queue.Queue()
 is_running = False
 total_censored_words = 0
 
+is_pure_recording = False
+pure_record_buffer = []
+
 # Buffers de sessão para exportação final
 session_audio_buffer = []
 session_metrics = []
 
+# Modelos globais para não recarregar ao trocar de abas
+whisper_model = None
+toxic_censor = None
+
 # ==========================================
 # THREADS DE PROCESSAMENTO (BACKEND)
 # ==========================================
+
+def load_models_if_needed(ui_callback, threshold_value):
+    global whisper_model, toxic_censor
+    if whisper_model is None or toxic_censor is None:
+        ui_callback(msg="Carregando modelos na GPU... Aguarde.")
+        whisper_model = WhisperModel("large-v3", device="cuda", compute_type="float16")
+        toxic_censor = ToxicCensor(threshold=threshold_value)
+        ui_callback(msg="✅ Modelos prontos!")
+    else:
+        # Atualiza o threshold caso o slider tenha sido mexido
+        toxic_censor.threshold = threshold_value
 
 def audio_producer_callback(indata, frames, time_info, status):
     if status:
@@ -63,7 +83,6 @@ def audio_playback_worker(play_realtime_ref):
     while is_running:
         try:
             audio_data = output_audio_queue.get(timeout=0.1)
-            # Só joga para a caixa de som se a chave estiver ativada na UI
             if play_realtime_ref():
                 stream.write(audio_data)
         except queue.Empty:
@@ -74,15 +93,11 @@ def audio_playback_worker(play_realtime_ref):
 def main_processing_loop(ui_callback, threshold_value):
     global is_running, total_censored_words, session_audio_buffer, session_metrics
     
-    ui_callback(msg="Carregando modelos na GPU... Aguarde.")
-    
     try:
-        whisper_model = WhisperModel("large-v3", device="cuda", compute_type="float16")
-        toxic_censor = ToxicCensor(threshold=threshold_value)
+        load_models_if_needed(ui_callback, threshold_value)
         audio_processor = AudioCensor(sample_rate=SAMPLE_RATE, overlap_duration=OVERLAP_DURATION)
         
-        ui_callback(msg="✅ Modelos prontos! Pipeline AO VIVO.")
-        
+        ui_callback(msg="✅ Pipeline AO VIVO iniciado.")
         chunk_count = 0
         
         with sd.InputStream(samplerate=SAMPLE_RATE, channels=CHANNELS, 
@@ -106,26 +121,19 @@ def main_processing_loop(ui_callback, threshold_value):
                 for segment in segments:
                     if segment.words:
                         for w in segment.words:
-                            words_found.append({
-                                "word": w.word.strip(),
-                                "start": w.start,
-                                "end": w.end
-                            })
+                            words_found.append({"word": w.word.strip(), "start": w.start, "end": w.end})
                 
                 # B: IA de Censura
                 toxic_intervals = toxic_censor.detect_toxic_words(words_found)
                 
-                # C: Edição Matemática (Avisa se for o primeiro chunk para não cortar o início)
+                # C: Edição Matemática
                 is_first = (chunk_count == 0)
                 final_audio = audio_processor.process_chunk(audio_data, toxic_intervals, is_first_chunk=is_first)
                 
-                # Acumula no buffer para exportar depois
                 session_audio_buffer.append(final_audio)
-                
-                # D: Fila de playback
                 output_audio_queue.put(final_audio.reshape(-1, 1))
                 
-                # E: Cálculo e Armazenamento de Métricas
+                # E: Métricas
                 processing_time = time.time() - start_time
                 rtf = processing_time / CHUNK_DURATION
                 session_metrics.append({"rtf": rtf, "proc_time": processing_time})
@@ -134,11 +142,9 @@ def main_processing_loop(ui_callback, threshold_value):
                     censored_count = len(toxic_intervals)
                     total_censored_words += censored_count
                     censored_words_str = ", ".join([f"{t['word']} [{t['label']}]" for t in toxic_intervals])
-                    log_msg = f"🚨 BLOQUEADO: {censored_words_str}"
-                    ui_callback(msg=log_msg, rtf_val=rtf, new_censored=censored_count)
+                    ui_callback(msg=f"🚨 BLOQUEADO: {censored_words_str}", rtf_val=rtf, new_censored=censored_count)
                 else:
-                    log_msg = f"✓ Chunk {chunk_count+1} limpo processado."
-                    ui_callback(msg=log_msg, rtf_val=rtf, new_censored=0)
+                    ui_callback(msg=f"✓ Chunk {chunk_count+1} limpo.", rtf_val=rtf, new_censored=0)
                     
                 chunk_count += 1
 
@@ -147,58 +153,87 @@ def main_processing_loop(ui_callback, threshold_value):
         ui_callback(msg=f"❌ Erro fatal: {str(e)}")
 
 
+def pure_record_callback(indata, frames, time_info, status):
+    """Apenas guarda o áudio na memória, sem IA."""
+    if status:
+        print(f"⚠️ Status mic: {status}")
+    if is_pure_recording:
+        pure_record_buffer.append(indata.copy())
+
+def process_recorded_buffer(audio_chunks, save_path, ui_callback, threshold_value):
+    """Pega o áudio gravado, passa na IA e salva no local escolhido."""
+    try:
+        if not audio_chunks:
+            ui_callback(msg="⚠️ Nenhum áudio foi gravado.")
+            return
+
+        ui_callback(msg="⚙️ Processando a gravação offline... Aguarde.")
+        
+        # Junta todos os pedacinhos gravados em um único array
+        full_audio = np.concatenate(audio_chunks).flatten()
+        
+        load_models_if_needed(ui_callback, threshold_value)
+        start_time = time.time()
+        
+        # Transcreve o áudio inteiro de uma vez
+        segments, _ = whisper_model.transcribe(
+            full_audio, language="en", word_timestamps=True, beam_size=5
+        )
+        
+        words_found = []
+        for segment in segments:
+            if segment.words:
+                for w in segment.words:
+                    words_found.append({"word": w.word.strip(), "start": w.start, "end": w.end})
+                    
+        ui_callback(msg="🕵️ Analisando toxicidade...")
+        toxic_intervals = toxic_censor.detect_toxic_words(words_found)
+        
+        # Aplica os bipes (Overlap 0 pois é offline)
+        offline_censor = AudioCensor(sample_rate=SAMPLE_RATE, overlap_duration=0.0)
+        final_audio = offline_censor.process_chunk(full_audio, toxic_intervals, is_first_chunk=True)
+        
+        # Salva no arquivo escolhido pelo usuário
+        sf.write(save_path, final_audio, SAMPLE_RATE)
+        
+        proc_time = time.time() - start_time
+        ui_callback(msg=f"✅ Áudio salvo com sucesso em:\n{save_path}")
+        ui_callback(msg=f"⏱️ Tempo de IA: {proc_time:.2f}s | Censuras: {len(toxic_intervals)}")
+        
+    except Exception as e:
+        ui_callback(msg=f"❌ Erro ao processar gravação: {str(e)}")
+
+
 def export_session():
-    """Compila o áudio em memória para um arquivo WAV e gera relatório."""
     global session_audio_buffer, session_metrics
-    
     if not session_audio_buffer:
         return
         
-    print("\n" + "="*50)
-    print("📊 RELATÓRIO DE MÉTRICAS DA SESSÃO")
-    print("="*50)
-    
-    # 1. Exportação do Áudio
     full_audio = np.concatenate(session_audio_buffer)
-    # Converte float32 (-1.0 a 1.0) para int16
     audio_int16 = np.int16(full_audio * 32767)
     
     filename = "output_censored.wav"
     with wave.open(filename, "w") as f:
         f.setnchannels(CHANNELS)
-        f.setsampwidth(2) # 2 bytes para int16
+        f.setsampwidth(2)
         f.setframerate(SAMPLE_RATE)
         f.writeframes(audio_int16.tobytes())
         
-    print(f"✅ Áudio salvo com sucesso: {filename} ({len(full_audio)/SAMPLE_RATE:.2f} segundos)")
-    
-    # 2. Resumo de Métricas de Engenharia
-    total_chunks = len(session_metrics)
-    avg_rtf = sum(m["rtf"] for m in session_metrics) / total_chunks
-    max_rtf = max(m["rtf"] for m in session_metrics)
-    avg_proc = sum(m["proc_time"] for m in session_metrics) / total_chunks
-    
-    print(f"📈 Total de Chunks Processados: {total_chunks}")
-    print(f"⚡ Média de Processamento por Chunk: {avg_proc:.3f}s")
-    print(f"⏱️ RTF Médio: {avg_rtf:.3f} (Ideal: < 1.0)")
-    print(f"⚠️ RTF Máximo de pico: {max_rtf:.3f}")
-    print("="*50 + "\n")
+    print(f"✅ Gravação Ao Vivo salva: {filename}")
 
 
 # ==========================================
-# INTERFACE GRÁFICA MODERNA (CustomTkinter)
+# INTERFACE GRÁFICA MODERNA
 # ==========================================
-
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
 
 class AudioStreamUI(ctk.CTk):
     def __init__(self):
         super().__init__()
-        
         self.title("FamilyFriend AI - Censor Pipeline")
-        self.geometry("800x500")
-        self.minsize(800, 500)
+        self.geometry("850x550")
+        self.minsize(850, 550)
         
         self.grid_rowconfigure(0, weight=1)
         self.grid_columnconfigure(1, weight=1)
@@ -211,19 +246,15 @@ class AudioStreamUI(ctk.CTk):
         self.sidebar.grid(row=0, column=0, sticky="nsew")
         self.sidebar.grid_rowconfigure(6, weight=1) 
         
-        self.logo_label = ctk.CTkLabel(self.sidebar, text="🛡️ FamilyFriend", font=ctk.CTkFont(size=22, weight="bold"))
+        self.logo_label = ctk.CTkLabel(self.sidebar, text="FamilyFriend", font=ctk.CTkFont(size=22, weight="bold"))
         self.logo_label.grid(row=0, column=0, padx=20, pady=(30, 20))
         
         self.status_badge = ctk.CTkLabel(self.sidebar, text="● INATIVO", text_color="gray", font=ctk.CTkFont(size=14, weight="bold"))
         self.status_badge.grid(row=1, column=0, padx=20, pady=10)
         
-        self.btn_toggle = ctk.CTkButton(self.sidebar, text="INICIAR PIPELINE", height=40, fg_color="#10B981", hover_color="#059669", font=ctk.CTkFont(weight="bold"), command=self.toggle_stream)
-        self.btn_toggle.grid(row=2, column=0, padx=20, pady=20)
-        
-        # Novo: Switch para ligar/desligar o áudio ao vivo
         self.switch_realtime = ctk.CTkSwitch(self.sidebar, text="Som ao Vivo (Loopback)")
-        self.switch_realtime.grid(row=3, column=0, padx=20, pady=(0, 20), sticky="w")
-        self.switch_realtime.deselect() # Começa mutado por padrão para evitar eco
+        self.switch_realtime.grid(row=3, column=0, padx=20, pady=(10, 20), sticky="w")
+        self.switch_realtime.deselect()
         
         self.lbl_thresh = ctk.CTkLabel(self.sidebar, text="Sensibilidade: 0.50", font=ctk.CTkFont(size=12))
         self.lbl_thresh.grid(row=4, column=0, padx=20, pady=(10, 0), sticky="w")
@@ -238,25 +269,44 @@ class AudioStreamUI(ctk.CTk):
         self.main_frame.grid_rowconfigure(1, weight=1)
         self.main_frame.grid_columnconfigure(0, weight=1)
         
-        self.dash_frame = ctk.CTkFrame(self.main_frame, height=80)
-        self.dash_frame.grid(row=0, column=0, pady=(0, 20), sticky="ew")
-        self.dash_frame.grid_columnconfigure((0, 1), weight=1)
+        # SISTEMA DE ABAS
+        self.tabview = ctk.CTkTabview(self.main_frame, height=140)
+        self.tabview.grid(row=0, column=0, pady=(0, 20), sticky="ew")
+        self.tab_live = self.tabview.add("📡 Mic (Stream)")
+        self.tab_file = self.tabview.add("📁 Gravação (Batch)")
         
-        self.rtf_box = ctk.CTkFrame(self.dash_frame, fg_color="transparent")
-        self.rtf_box.grid(row=0, column=0, padx=20, pady=15, sticky="w")
+        # --- CONTEÚDO ABA LIVE ---
+        self.tab_live.grid_columnconfigure((0, 1), weight=1)
+        self.rtf_box = ctk.CTkFrame(self.tab_live, fg_color="transparent")
+        self.rtf_box.grid(row=0, column=0, padx=20, pady=10, sticky="w")
         ctk.CTkLabel(self.rtf_box, text="REAL TIME FACTOR (RTF)", font=ctk.CTkFont(size=11)).pack(anchor="w")
         self.rtf_label = ctk.CTkLabel(self.rtf_box, text="--", font=ctk.CTkFont(size=28, weight="bold"))
         self.rtf_label.pack(anchor="w")
         
-        self.blocks_box = ctk.CTkFrame(self.dash_frame, fg_color="transparent")
-        self.blocks_box.grid(row=0, column=1, padx=20, pady=15, sticky="e")
+        self.blocks_box = ctk.CTkFrame(self.tab_live, fg_color="transparent")
+        self.blocks_box.grid(row=0, column=1, padx=20, pady=10, sticky="e")
         ctk.CTkLabel(self.blocks_box, text="OFENSAS BLOQUEADAS", font=ctk.CTkFont(size=11)).pack(anchor="e")
         self.blocks_label = ctk.CTkLabel(self.blocks_box, text="0", font=ctk.CTkFont(size=28, weight="bold"), text_color="#EF4444")
         self.blocks_label.pack(anchor="e")
         
+        self.btn_toggle = ctk.CTkButton(self.tab_live, text="INICIAR PIPELINE", height=40, fg_color="#10B981", hover_color="#059669", font=ctk.CTkFont(weight="bold"), command=self.toggle_stream)
+        self.btn_toggle.grid(row=1, column=0, columnspan=2, pady=10)
+        
+        # --- CONTEÚDO ABA GRAVAÇÃO ---
+        self.tab_file.grid_columnconfigure(0, weight=1)
+        self.btn_record = ctk.CTkButton(
+            self.tab_file, 
+            text="🔴 INICIAR GRAVAÇÃO", 
+            height=60, 
+            font=ctk.CTkFont(size=16, weight="bold"), 
+            command=self.toggle_pure_recording
+        )
+        self.btn_record.grid(row=0, column=0, pady=40)
+        
+        # --- CONSOLE COMPARTILHADO ---
         self.log_console = ctk.CTkTextbox(self.main_frame, font=ctk.CTkFont(family="Consolas", size=13))
         self.log_console.grid(row=1, column=0, sticky="nsew")
-        self.log_console.insert("0.0", "Sistema inicializado.\nDesligue o 'Som ao Vivo' se não quiser eco.\n")
+        self.log_console.insert("0.0", "Sistema inicializado. Escolha uma aba acima.\n")
         self.log_console.configure(state="disabled")
 
     def _update_thresh_lbl(self, value):
@@ -282,6 +332,53 @@ class AudioStreamUI(ctk.CTk):
         if new_censored > 0:
             self.blocks_label.configure(text=str(total_censored_words))
 
+    def toggle_pure_recording(self):
+        global is_pure_recording, pure_record_buffer
+        
+        if is_running:
+            self.safe_ui_update(msg="⚠️ Pare o modo 'Mic (Stream)' antes de usar a gravação.")
+            return
+
+        if not is_pure_recording:
+            # INICIA A GRAVAÇÃO
+            is_pure_recording = True
+            pure_record_buffer = []
+            self.btn_record.configure(text="⏹️ PARAR E SALVAR", fg_color="#EF4444", hover_color="#B91C1C")
+            self.safe_ui_update(msg="\n🎙️ GRAVANDO... Fale no microfone.")
+            
+            # Abre o microfone apenas para armazenar os dados
+            self.rec_stream = sd.InputStream(
+                samplerate=SAMPLE_RATE, channels=CHANNELS, 
+                dtype='float32', callback=pure_record_callback
+            )
+            self.rec_stream.start()
+            
+        else:
+            # PARA A GRAVAÇÃO E PEDE O NOME DO ARQUIVO
+            is_pure_recording = False
+            self.rec_stream.stop()
+            self.rec_stream.close()
+            
+            self.btn_record.configure(text="🔴 INICIAR GRAVAÇÃO", fg_color="#3B82F6", hover_color="#2563EB")
+            
+            # AQUI: Pede para VOCÊ escolher o nome do arquivo que será salvo
+            save_path = filedialog.asksaveasfilename(
+                title="Salvar gravação censurada",
+                defaultextension=".wav",
+                filetypes=[("Áudio WAV", "*.wav")]
+            )
+            
+            if save_path:
+                current_threshold = self.slider_thresh.get()
+                # Roda a IA em uma Thread separada para não travar a tela
+                threading.Thread(
+                    target=process_recorded_buffer, 
+                    args=(pure_record_buffer.copy(), save_path, self.safe_ui_update, current_threshold),
+                    daemon=True
+                ).start()
+            else:
+                self.safe_ui_update(msg="❌ Salvamento cancelado. Áudio descartado.")
+
     def toggle_stream(self):
         global is_running, total_censored_words, session_audio_buffer, session_metrics
         
@@ -293,7 +390,10 @@ class AudioStreamUI(ctk.CTk):
             
             self.status_badge.configure(text="● GRAVANDO", text_color="#EF4444")
             self.btn_toggle.configure(text="PARAR E SALVAR", fg_color="#EF4444", hover_color="#B91C1C")
-            self.slider_thresh.configure(state="disabled")
+            
+            # CORREÇÃO AQUI: Atualizado para o novo nome do botão
+            self.btn_record.configure(state="disabled") 
+            
             self.blocks_label.configure(text="0")
             self.rtf_label.configure(text="--", text_color="white")
             self.safe_ui_update(msg="\n" + "="*40 + "\n🚀 INICIANDO PIPELINE DE ÁUDIO...\n" + "="*40)
@@ -312,11 +412,11 @@ class AudioStreamUI(ctk.CTk):
             is_running = False
             self.status_badge.configure(text="● INATIVO", text_color="gray")
             self.btn_toggle.configure(text="INICIAR PIPELINE", fg_color="#10B981", hover_color="#059669")
-            self.slider_thresh.configure(state="normal")
             
-            self.safe_ui_update(msg="\n🛑 COMPILANDO ÁUDIO... OLHE O TERMINAL.")
+            # CORREÇÃO AQUI: Atualizado para o novo nome do botão
+            self.btn_record.configure(state="normal")
             
-            # Exporta os dados num thread separado para não travar a UI
+            self.safe_ui_update(msg="\n🛑 COMPILANDO ÁUDIO AO VIVO...")
             threading.Thread(target=export_session, daemon=True).start()
 
 if __name__ == "__main__":
