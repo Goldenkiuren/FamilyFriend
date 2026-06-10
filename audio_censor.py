@@ -6,7 +6,6 @@ class AudioCensor:
         self.sample_rate = sample_rate
         self.beep_freq = beep_freq
         self.overlap_samples = int(overlap_duration * sample_rate)
-        # Margens para o Bip Clássico (Ao Vivo)
         self.beep_margin_start = beep_margin_start
         self.beep_margin_end = beep_margin_end
 
@@ -46,10 +45,6 @@ class AudioCensor:
         return trimmed_audio
 
     def _insert_with_crossfade(self, original_audio, new_audio, start_idx, end_idx, fade_samples=1024):
-        """
-        Crossfade mais suave e longo (1024 amostras = ~64ms em 16kHz) 
-        ideal para cortes feitos em momentos de pausa/silêncio.
-        """
         before = original_audio[:start_idx].copy()
         after = original_audio[end_idx:].copy()
         
@@ -68,8 +63,34 @@ class AudioCensor:
         size_diff = len(new_audio) - (end_idx - start_idx)
         return result, size_diff
 
+    def _find_dynamic_silence(self, audio_array, start_idx, direction="forward", max_search_sec=1.0, window_ms=20, threshold=0.015):
+        # Proteção contra busca nula (quando palavras estão coladas)
+        if max_search_sec <= 0.01:
+            return start_idx
+
+        max_search_samples = int(max_search_sec * self.sample_rate)
+        window_samples = int((window_ms / 1000.0) * self.sample_rate)
+        
+        if direction == "forward":
+            search_area = audio_array[start_idx : start_idx + max_search_samples]
+        else: 
+            search_area = audio_array[max(0, start_idx - max_search_samples) : start_idx]
+            search_area = search_area[::-1] 
+            
+        if len(search_area) < window_samples:
+            return start_idx
+            
+        for i in range(0, len(search_area) - window_samples, window_samples):
+            window = search_area[i : i + window_samples]
+            rms = np.sqrt(np.mean(window**2))
+            
+            if rms < threshold:
+                offset = i + (window_samples // 2)
+                return start_idx + offset if direction == "forward" else start_idx - offset
+                
+        return start_idx + max_search_samples if direction == "forward" else max(0, start_idx - max_search_samples)
+
     def process_chunk(self, audio_chunk, toxic_intervals, is_first_chunk=False):
-        """Aplicado no áudio Ao Vivo (Streaming) - Usa Bip clássico."""
         censored_chunk = audio_chunk.copy()
         chunk_duration = len(audio_chunk) / self.sample_rate
         
@@ -92,10 +113,10 @@ class AudioCensor:
             return censored_chunk[self.overlap_samples:]
         return censored_chunk
 
-    def _build_replacement_phrases(self, words_list, toxic_intervals, pause_threshold=0.5):
+    def _build_replacement_phrases(self, words_list, toxic_intervals, pause_threshold=0.5, max_duration=9.0):
         """
         Agrupa palavras em 'blocos de respiração' (frases).
-        Se a frase contiver palavras tóxicas, prepara o bloco para ser recriado.
+        FORÇA a quebra se a frase atingir o max_duration (9 segundos) para evitar o erro 'clipping short' do F5-TTS.
         """
         phrases_to_replace = []
         if not words_list or not toxic_intervals:
@@ -104,7 +125,6 @@ class AudioCensor:
         current_phrase_words = []
         current_toxic_replacements = {} 
 
-        # Mapeia palavras tóxicas por tempo de início para busca rápida
         toxic_map = {round(t["start"], 2): t for t in toxic_intervals}
 
         for i, w in enumerate(words_list):
@@ -115,11 +135,13 @@ class AudioCensor:
                 current_toxic_replacements[i] = toxic_map[start_time_rounded].get("replacement", "bleep")
 
             current_phrase_words.append((i, w))
+            
+            # Calcula o tamanho da frase atual em segundos
+            current_duration = w["end"] - current_phrase_words[0][1]["start"]
 
             is_last_word = (i == len(words_list) - 1)
             break_phrase = is_last_word
 
-            # Lógica de quebra de frase: Silêncio ou Pontuação forte
             if not is_last_word:
                 next_w = words_list[i+1]
                 gap = next_w["start"] - w["end"]
@@ -127,10 +149,10 @@ class AudioCensor:
                 clean_word = w["word"].strip()
                 punctuation_break = clean_word.endswith(('.', '!', '?'))
                 
-                if gap > pause_threshold or punctuation_break:
+                # A NOVA TRAVA: Se passar de 9 segundos, forçamos o corte imediatamente!
+                if gap > pause_threshold or punctuation_break or current_duration >= max_duration:
                     break_phrase = True
 
-            # Se a frase acabou, validamos se precisa de censura
             if break_phrase:
                 if current_toxic_replacements:
                     ref_words = []
@@ -138,6 +160,21 @@ class AudioCensor:
                     
                     start_time = current_phrase_words[0][1]["start"]
                     end_time = current_phrase_words[-1][1]["end"]
+
+                    # Caixa de contenção segura (Safe Bounding Box)
+                    first_word_idx = current_phrase_words[0][0]
+                    last_word_idx = current_phrase_words[-1][0]
+
+                    safe_start = max(0.0, start_time - 0.15)
+                    safe_end = end_time + 0.25
+                    
+                    if first_word_idx > 0:
+                        prev_word_end = words_list[first_word_idx - 1]["end"]
+                        safe_start = max(prev_word_end, safe_start)
+
+                    if last_word_idx < len(words_list) - 1:
+                        next_word_start = words_list[last_word_idx + 1]["start"]
+                        safe_end = min(next_word_start, safe_end)
 
                     for idx, word_info in current_phrase_words:
                         clean_w = word_info["word"].strip()
@@ -148,18 +185,18 @@ class AudioCensor:
                         else:
                             gen_words.append(clean_w)
 
-                    # Remove pontuações que o Whisper traz coladas nas palavras para não quebrar o prompt
                     ref_text = " ".join(ref_words).strip()
                     gen_text = " ".join(gen_words).strip()
 
                     phrases_to_replace.append({
                         "start": start_time,
                         "end": end_time,
+                        "safe_start": safe_start,
+                        "safe_end": safe_end,
                         "ref_text": ref_text,
                         "gen_text": gen_text
                     })
 
-                # Reseta os buffers para a próxima frase
                 current_phrase_words = []
                 current_toxic_replacements = {}
 
@@ -174,25 +211,30 @@ class AudioCensor:
         final_audio = full_audio.copy()
         accumulated_offset = 0
 
-        # Passo 1: Converter palavras isoladas em blocos de contexto (Frases)
         phrases_to_replace = self._build_replacement_phrases(
             words_list=words_list, 
             toxic_intervals=toxic_intervals,
-            pause_threshold=0.5 # Corta se o silêncio for maior que 0.5s
+            pause_threshold=0.5
         )
 
         for phrase in phrases_to_replace:
-            # Pegamos um pequeno respiro ao redor da frase (0.1s)
-            orig_start_time = max(0.0, phrase["start"] - 0.1)
-            orig_end_time = phrase["end"] + 0.1
+            whisper_start_idx = int(phrase["start"] * self.sample_rate)
+            whisper_end_idx = int(phrase["end"] * self.sample_rate)
             
-            orig_start_idx = int(orig_start_time * self.sample_rate)
-            orig_end_idx = int(orig_end_time * self.sample_rate)
+            # Forçamos a busca do silêncio a obedecer à caixa de segurança
+            max_back_sec = max(0.0, phrase["start"] - phrase["safe_start"])
+            max_fwd_sec = max(0.0, phrase["safe_end"] - phrase["end"])
+            
+            orig_start_idx = self._find_dynamic_silence(
+                full_audio, whisper_start_idx, direction="backward", max_search_sec=max_back_sec
+            )
+            orig_end_idx = self._find_dynamic_silence(
+                full_audio, whisper_end_idx, direction="forward", max_search_sec=max_fwd_sec
+            )
             
             start_idx = orig_start_idx + accumulated_offset
             end_idx = orig_end_idx + accumulated_offset
             
-            # Travas de segurança
             start_idx = max(0, min(start_idx, len(final_audio)))
             end_idx = max(0, min(end_idx, len(final_audio)))
 
@@ -205,7 +247,6 @@ class AudioCensor:
             print(f"   Censurado: '{gen_text}'")
             
             try:
-                # O F5-TTS recria a frase com a prosódia completa!
                 generated_phrase_array = voice_cloner.generate_replacement(
                     reference_audio_array=reference_audio,
                     ref_text=ref_text,
@@ -214,13 +255,12 @@ class AudioCensor:
                 
                 processed_phrase = self._trim_and_normalize(generated_phrase_array, reference_audio)
                 
-                # Crossfade ocorre no silêncio/respiração da frase, não no meio de uma vogal
                 final_audio, size_diff = self._insert_with_crossfade(
                     original_audio=final_audio, 
                     new_audio=processed_phrase, 
                     start_idx=start_idx, 
                     end_idx=end_idx,
-                    fade_samples=1024  # ~64ms fade, bem macio
+                    fade_samples=1024
                 )
                 
                 accumulated_offset += size_diff
@@ -228,7 +268,8 @@ class AudioCensor:
                 
             except Exception as e:
                 print(f"⚠️ Erro ao clonar frase '{ref_text}'. Aplicando Bip de fallback. Erro: {e}")
-                duration = orig_end_time - orig_start_time
+                
+                duration = (orig_end_idx - orig_start_idx) / self.sample_rate
                 beep = self._generate_beep(duration)
                 final_audio, size_diff = self._insert_with_crossfade(final_audio, beep, start_idx, end_idx)
                 accumulated_offset += size_diff

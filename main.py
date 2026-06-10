@@ -186,7 +186,7 @@ def process_recorded_buffer(audio_chunks, save_path, ui_callback, threshold_valu
         start_time = time.time()
         
         segments, _ = whisper_model.transcribe(
-            full_audio, language="en", word_timestamps=True, beam_size=5
+            full_audio, language="en", word_timestamps=True, beam_size=5, vad_filter=True
         )
         
         words_found = []

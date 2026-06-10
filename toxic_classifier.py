@@ -40,51 +40,71 @@ class ToxicCensor:
         sentence_scores = self.classifier(full_text)[0]
         scores_dict = {score['label']: score['score'] for score in sentence_scores}
         
-        # Categorias que você quer censurar
         target_labels = ['obscene', 'identity_hate', 'severe_toxic', 'insult']
         
-        if not any(scores_dict.get(label, 0) > self.threshold for label in target_labels):
-            return []
+        # Guardamos se a frase é tóxica, mas NÃO damos um 'return []' antecipado.
+        sentence_is_toxic = any(scores_dict.get(label, 0) > self.threshold for label in target_labels)
             
         intervals_to_censor = []
         
+        # Importa o dicionário apenas se o modo híbrido (offline) estiver ativo
+        if use_synonyms:
+            from toxic_synonyms import TOXIC_SYNONYMS
+        
         for w_info in words_list:
             clean_word = w_info["word"].strip(string.punctuation + " \t\n\r")
+            lower_word = clean_word.lower()
             
             if len(clean_word) < 2:
                 continue
                 
-            word_score = self.classifier(clean_word)[0]
-            w_scores_dict = {s['label']: s['score'] for s in word_score}
-            
-            # Filtra apenas as labels que passaram do limiar de censura
-            triggered_labels = {
-                label: w_scores_dict.get(label, 0) 
-                for label in target_labels 
-                if w_scores_dict.get(label, 0) > self.threshold
-            }
-            
-            if triggered_labels:
-                # Encontra qual foi a categoria com a maior pontuação para essa palavra
-                top_label = max(triggered_labels, key=triggered_labels.get)
-                top_score = triggered_labels[top_label]
-                
-                # AQUI: Lógica unificada para definir o sinônimo apenas se solicitado
-                replacement = None
-                if use_synonyms:
-                    from toxic_synonyms import TOXIC_SYNONYMS
-                    replacement = TOXIC_SYNONYMS.get(clean_word.lower(), "bleep")
-                
-                # Adiciona na lista uma única vez, com todas as chaves corretas
+            # ================================================================
+            # PASSO 1 (HÍBRIDO): Verificação Rígida de Dicionário
+            # ================================================================
+            # Só ocorre no modo gravação (onde use_synonyms é True)
+            if use_synonyms and lower_word in TOXIC_SYNONYMS:
                 intervals_to_censor.append({
                     "start": w_info["start"],
                     "end": w_info["end"],
                     "word": clean_word,
-                    "replacement": replacement,
-                    "label": top_label,
-                    "score": top_score
+                    "replacement": TOXIC_SYNONYMS[lower_word],
+                    "label": "hard_dict_match",
+                    "score": 1.0  # Confiança máxima pois é um match direto no dicionário
                 })
+                continue # Pula a IA para essa palavra, já resolvemos
                 
+            # ================================================================
+            # PASSO 2 (IA Clássica): RoBERTa
+            # ================================================================
+            # Se a palavra não estava no dicionário (ou se estamos ao vivo e o dicionário está desligado),
+            # verificamos se a IA achou a frase suspeita para investigar a palavra.
+            if sentence_is_toxic:
+                word_score = self.classifier(clean_word)[0]
+                w_scores_dict = {s['label']: s['score'] for s in word_score}
+                
+                triggered_labels = {
+                    label: w_scores_dict.get(label, 0) 
+                    for label in target_labels 
+                    if w_scores_dict.get(label, 0) > self.threshold
+                }
+                
+                if triggered_labels:
+                    top_label = max(triggered_labels, key=triggered_labels.get)
+                    top_score = triggered_labels[top_label]
+                    
+                    replacement = None
+                    if use_synonyms:
+                        continue
+                    
+                    intervals_to_censor.append({
+                        "start": w_info["start"],
+                        "end": w_info["end"],
+                        "word": clean_word,
+                        "replacement": replacement,
+                        "label": top_label,
+                        "score": top_score
+                    })
+                    
         return intervals_to_censor
 
 # ==========================================
@@ -105,12 +125,12 @@ if __name__ == "__main__":
     print("\nSimulando entrada do Whisper:")
     print("Frase gerada: 'Hey you fucking idiot stop talking'")
     
-    # Testando com a flag ativada
-    toxic_intervals = censor.detect_toxic_words(mock_whisper_output, use_synonyms=True)
-    
-    print("\nResultados do Censor:")
-    if toxic_intervals:
-        for item in toxic_intervals:
-            print(f"🚨 Detectado: '{item['word']}' [{item['label']}] -> Substituir por: '{item['replacement']}'")
-    else:
-        print("Tudo limpo, nenhum bip necessário.")
+    print("\n--- Teste 1: Modo Ao Vivo (use_synonyms=False) ---")
+    live_intervals = censor.detect_toxic_words(mock_whisper_output, use_synonyms=False)
+    for item in live_intervals:
+        print(f"🚨 Detectado pela IA: '{item['word']}' [{item['label']}]")
+        
+    print("\n--- Teste 2: Modo Gravação Híbrido (use_synonyms=True) ---")
+    offline_intervals = censor.detect_toxic_words(mock_whisper_output, use_synonyms=True)
+    for item in offline_intervals:
+        print(f"🚨 Detectado (IA ou Dict): '{item['word']}' [{item['label']}] -> Substituir por: '{item['replacement']}'")
