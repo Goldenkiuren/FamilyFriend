@@ -41,6 +41,7 @@ session_metrics = []
 # Modelos globais para não recarregar ao trocar de abas
 whisper_model = None
 toxic_censor = None
+voice_cloner = None
 
 # ==========================================
 # THREADS DE PROCESSAMENTO (BACKEND)
@@ -124,7 +125,7 @@ def main_processing_loop(ui_callback, threshold_value):
                             words_found.append({"word": w.word.strip(), "start": w.start, "end": w.end})
                 
                 # B: IA de Censura
-                toxic_intervals = toxic_censor.detect_toxic_words(words_found)
+                toxic_intervals = toxic_censor.detect_toxic_words(words_found, use_synonyms=False)
                 
                 # C: Edição Matemática
                 is_first = (chunk_count == 0)
@@ -160,22 +161,30 @@ def pure_record_callback(indata, frames, time_info, status):
     if is_pure_recording:
         pure_record_buffer.append(indata.copy())
 
-def process_recorded_buffer(audio_chunks, save_path, ui_callback, threshold_value):
+def process_recorded_buffer(audio_chunks, save_path, ui_callback, threshold_value, use_voice_cloning=True):
     """Pega o áudio gravado, passa na IA e salva no local escolhido."""
+    global whisper_model, toxic_censor, voice_cloner
+    
     try:
         if not audio_chunks:
             ui_callback(msg="⚠️ Nenhum áudio foi gravado.")
             return
 
         ui_callback(msg="⚙️ Processando a gravação offline... Aguarde.")
-        
-        # Junta todos os pedacinhos gravados em um único array
         full_audio = np.concatenate(audio_chunks).flatten()
         
+        # 1. Carrega Whisper e RoBERTa
         load_models_if_needed(ui_callback, threshold_value)
+        
+        # 2. Lazy Loading do Voice Cloner (SÓ carrega se o usuário ativou o botão)
+        if use_voice_cloning and voice_cloner is None:
+            ui_callback(msg="🗣️ Carregando motor de clonagem de voz (F5-TTS)...")
+            from voice_cloner import VoiceCloner
+            voice_cloner = VoiceCloner()
+            ui_callback(msg="✅ Motor de voz carregado!")
+
         start_time = time.time()
         
-        # Transcreve o áudio inteiro de uma vez
         segments, _ = whisper_model.transcribe(
             full_audio, language="en", word_timestamps=True, beam_size=5
         )
@@ -186,21 +195,42 @@ def process_recorded_buffer(audio_chunks, save_path, ui_callback, threshold_valu
                 for w in segment.words:
                     words_found.append({"word": w.word.strip(), "start": w.start, "end": w.end})
                     
+                    
         ui_callback(msg="🕵️ Analisando toxicidade...")
-        toxic_intervals = toxic_censor.detect_toxic_words(words_found)
+        # Usa sinônimos apenas se o modo de voz estiver ativo
+        toxic_intervals = toxic_censor.detect_toxic_words(words_found, use_synonyms=use_voice_cloning)
         
-        # Aplica os bipes (Overlap 0 pois é offline)
+        ui_callback(msg=f"✂️ {len(toxic_intervals)} ofensas encontradas. Iniciando edição...")
+        
         offline_censor = AudioCensor(sample_rate=SAMPLE_RATE, overlap_duration=0.0)
-        final_audio = offline_censor.process_chunk(full_audio, toxic_intervals, is_first_chunk=True)
         
-        # Salva no arquivo escolhido pelo usuário
+        # AQUI ESTÁ A BIFURCAÇÃO DA SUA NOVA FEATURE
+        if use_voice_cloning:
+            final_audio = offline_censor.process_offline_replacement(
+                full_audio=full_audio, 
+                toxic_intervals=toxic_intervals,
+                words_list=words_found,
+                voice_cloner=voice_cloner
+            )
+        else:
+            ui_callback(msg="🔇 Modo Bip selecionado. Aplicando censura clássica...")
+            # A função process_chunk serve perfeitamente para o áudio inteiro se overlap for 0
+            final_audio = offline_censor.process_chunk(
+                audio_chunk=full_audio, 
+                toxic_intervals=toxic_intervals, 
+                is_first_chunk=True
+            )
+        
+        import soundfile as sf
         sf.write(save_path, final_audio, SAMPLE_RATE)
         
         proc_time = time.time() - start_time
         ui_callback(msg=f"✅ Áudio salvo com sucesso em:\n{save_path}")
-        ui_callback(msg=f"⏱️ Tempo de IA: {proc_time:.2f}s | Censuras: {len(toxic_intervals)}")
+        ui_callback(msg=f"⏱️ Tempo de Edição IA: {proc_time:.2f}s | Substituições: {len(toxic_intervals)}")
         
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         ui_callback(msg=f"❌ Erro ao processar gravação: {str(e)}")
 
 
@@ -294,6 +324,12 @@ class AudioStreamUI(ctk.CTk):
         
         # --- CONTEÚDO ABA GRAVAÇÃO ---
         self.tab_file.grid_columnconfigure(0, weight=1)
+        
+        # AQUI: O novo botão para escolher o modo
+        self.switch_censor_mode = ctk.CTkSwitch(self.tab_file, text="Usar IA de Clonagem de Voz", font=ctk.CTkFont(weight="bold"))
+        self.switch_censor_mode.grid(row=0, column=0, pady=(40, 10))
+        self.switch_censor_mode.select() # Deixar ativado por padrão
+        
         self.btn_record = ctk.CTkButton(
             self.tab_file, 
             text="🔴 INICIAR GRAVAÇÃO", 
@@ -301,7 +337,7 @@ class AudioStreamUI(ctk.CTk):
             font=ctk.CTkFont(size=16, weight="bold"), 
             command=self.toggle_pure_recording
         )
-        self.btn_record.grid(row=0, column=0, pady=40)
+        self.btn_record.grid(row=1, column=0, pady=20) # Mudei o row de 0 para 1
         
         # --- CONSOLE COMPARTILHADO ---
         self.log_console = ctk.CTkTextbox(self.main_frame, font=ctk.CTkFont(family="Consolas", size=13))
@@ -370,10 +406,12 @@ class AudioStreamUI(ctk.CTk):
             
             if save_path:
                 current_threshold = self.slider_thresh.get()
+                use_voice = self.switch_censor_mode.get() == 1  # <--- Lê o botão (1 é ativado, 0 desativado)
+                
                 # Roda a IA em uma Thread separada para não travar a tela
                 threading.Thread(
                     target=process_recorded_buffer, 
-                    args=(pure_record_buffer.copy(), save_path, self.safe_ui_update, current_threshold),
+                    args=(pure_record_buffer.copy(), save_path, self.safe_ui_update, current_threshold, use_voice), # <--- Adicione use_voice aqui
                     daemon=True
                 ).start()
             else:
