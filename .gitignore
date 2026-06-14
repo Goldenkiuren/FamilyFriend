@@ -160,4 +160,8 @@ cython_debug/
 #.idea/
 
 *.wav
+*.ogg
+*.mp3
 *.txt
+*.flac
+*.m4a
