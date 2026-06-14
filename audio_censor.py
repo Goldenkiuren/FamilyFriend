@@ -341,6 +341,7 @@ class AudioCensor:
                     ref_text=ref_text,
                     text_to_say=gen_text,
                     speed=speed,
+                    output_rate=self.sample_rate,
                 )
                 generated = self._trim_edges(generated)
                 if len(generated) < int(0.05 * sr):

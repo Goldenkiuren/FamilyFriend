@@ -8,23 +8,17 @@ from f5_tts.api import F5TTS
 
 class VoiceCloner:
     def __init__(self, device="cuda"):
-        print("🗣️ [VoiceCloner] Inicializando F5-TTS (Flow Matching) na GPU...")
-        
+        print("[VoiceCloner] Inicializando F5-TTS (Flow Matching) na GPU...")
+
         # A API oficial do F5-TTS baixa os pesos automaticamente na primeira execução
         self.tts = F5TTS(device=device)
-        self.original_rate = 24000  # O F5-TTS gera nativamente em 24kHz
-        self.target_rate = 16000    # O pipeline do AudioCensor usa 16kHz
-        
-        # Otimização DSP: Instanciamos o Resampler uma única vez na VRAM
-        self.resampler = torchaudio.transforms.Resample(
-            orig_freq=self.original_rate, 
-            new_freq=self.target_rate
-        ).to(device)
-        print("✅ [VoiceCloner] F5-TTS pronto para síntese Zero-Shot!")
+        self.device = device
+        self.f5_rate = 24000  # O F5-TTS gera nativamente em 24kHz
+        print("[VoiceCloner] F5-TTS pronto para sintese Zero-Shot.")
 
     def generate_replacement(self, reference_audio_array, ref_text, text_to_say,
                              nfe_step=48, cfg_strength=2.0, remove_silence=False, target_rms=0.1,
-                             speed=1.0):
+                             speed=1.0, output_rate=24000):
         """
         Gera a frase-portadora (carrier) usando a voz original do falante.
         - reference_audio_array: Áudio de referência LIMPO do falante (NumPy 16kHz).
@@ -39,8 +33,9 @@ class VoiceCloner:
             temp_path = temp_wav.name
 
         try:
-            # Salva o array de referência no disco na frequência original do sistema
-            sf.write(temp_path, reference_audio_array, self.target_rate)
+            # Salva a referência na MESMA taxa de saída do pipeline (preserva qualidade).
+            # O F5 reamostra internamente para 24kHz para processar.
+            sf.write(temp_path, reference_audio_array, int(output_rate))
 
             # 2. Inferência Zero-Shot
             # O modelo lê o áudio, cruza com o ref_text para mapear as frequências da voz,
@@ -56,21 +51,18 @@ class VoiceCloner:
                 speed=speed,
                 show_info=lambda *a, **k: None,
             )
-            
+
             # Isola o array de áudio (a API pode retornar uma tupla com métricas extras)
-            if isinstance(wav_output, tuple):
-                wav_array = wav_output[0]
-            else:
-                wav_array = wav_output
-                
-            # 3. Downsampling (24kHz -> 16kHz)
-            # Movemos os cálculos para o PyTorch para aproveitar a GPU e não gargalar a CPU
-            tensor_wav = torch.tensor(wav_array, dtype=torch.float32).unsqueeze(0).to(device="cuda")
-            resampled_tensor = self.resampler(tensor_wav)
-            
-            # 4. Devolve para CPU no formato exato que o seu AudioCensor exige
-            return resampled_tensor.squeeze(0).cpu().numpy()
-            
+            wav_array = wav_output[0] if isinstance(wav_output, tuple) else wav_output
+            wav_array = np.asarray(wav_array, dtype=np.float32)
+
+            # 3. Reamostra do nativo do F5 (24kHz) para a taxa do pipeline (na GPU)
+            if int(output_rate) == self.f5_rate:
+                return wav_array
+            tensor_wav = torch.as_tensor(wav_array, dtype=torch.float32, device=self.device).unsqueeze(0)
+            resampled = torchaudio.functional.resample(tensor_wav, self.f5_rate, int(output_rate))
+            return resampled.squeeze(0).cpu().numpy()
+
         finally:
             # Limpeza de rastro de memória
             if os.path.exists(temp_path):
