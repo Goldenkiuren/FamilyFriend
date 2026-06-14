@@ -78,8 +78,9 @@ def generate_censored_text(words_list, toxic_intervals, mode):
     return " ".join(censored_words)
 
 
+# MUDANÇA: Adicionado o parâmetro `use_vad` na assinatura da função
 def process_audio(proc_audio, proc_rate, subtype, is_file, save_path, ui_callback,
-                  threshold_value, selected_mode, save_orig, save_transcripts):
+                  threshold_value, selected_mode, save_orig, save_transcripts, use_vad):
     """Processa o áudio na sua taxa de amostragem NATIVA (preserva qualidade).
     O Whisper recebe uma cópia 16kHz separada; a edição e a saída ficam na taxa original."""
     global whisper_model, toxic_censor, voice_cloner
@@ -99,10 +100,12 @@ def process_audio(proc_audio, proc_rate, subtype, is_file, save_path, ui_callbac
         start_time = time.time()
 
         # 1. Transcrição (em cópia 16kHz mono; o áudio de trabalho continua na taxa nativa)
-        ui_callback(msg="Transcrevendo áudio com Whisper...")
+        ui_callback(msg=f"Transcrevendo áudio com Whisper... (VAD Filter: {'ATIVADO' if use_vad else 'DESATIVADO'})")
         whisper_audio = _to_whisper_audio(proc_audio, proc_rate)
+        
+        # MUDANÇA: vad_filter agora responde ao botão da interface
         segments, _ = whisper_model.transcribe(
-            whisper_audio, language="en", word_timestamps=True, beam_size=5, vad_filter=True
+            whisper_audio, language="en", word_timestamps=True, beam_size=5, vad_filter=use_vad
         )
 
         words_found = []
@@ -134,6 +137,7 @@ def process_audio(proc_audio, proc_rate, subtype, is_file, save_path, ui_callbac
             else:
                 sf.write(orig_path, proc_audio, proc_rate, subtype=subtype)
             ui_callback(msg=f"Cópia original salva: {orig_path}")
+            
         # 3. Processamento dos modos
         for mode in modes_to_run:
             if mode == "rewrite":
@@ -200,8 +204,8 @@ class AudioBatchUI(ctk.CTk):
     def __init__(self):
         super().__init__()
         self.title("FamilyFriend AI — Censor de Áudio")
-        self.geometry("920x620")
-        self.minsize(920, 620)
+        self.geometry("920x650") # MUDANÇA: Aumentado levemente para caber o novo botão
+        self.minsize(920, 650)
 
         self.grid_rowconfigure(0, weight=1)
         self.grid_columnconfigure(1, weight=1)
@@ -264,12 +268,12 @@ class AudioBatchUI(ctk.CTk):
         ctk.CTkRadioButton(self.mode_frame, text="4.  Gerar todas as saídas (modos 1 e 2)",
                            variable=self.censor_mode_var, value="all").pack(anchor="w", padx=22, pady=4)
 
-        # 2. OPÇÕES DE SALVAMENTO
+        # 2. OPÇÕES DE SALVAMENTO E FILTROS
         self.options_frame = ctk.CTkFrame(self.main_frame)
         self.options_frame.grid(row=1, column=0, pady=(0, 16), sticky="ew", ipadx=10, ipady=5)
 
         ctk.CTkLabel(
-            self.options_frame, text="Opções de salvamento", font=ctk.CTkFont(size=14, weight="bold")
+            self.options_frame, text="Opções Avançadas e Salvamento", font=ctk.CTkFont(size=14, weight="bold")
         ).pack(anchor="w", padx=14, pady=(8, 6))
 
         self.chk_save_orig_var = ctk.BooleanVar(value=True)
@@ -281,6 +285,12 @@ class AudioBatchUI(ctk.CTk):
         ctk.CTkCheckBox(self.options_frame,
                         text="Salvar .txt com transcrições (original e censurada)",
                         variable=self.chk_save_trans_var).pack(anchor="w", padx=22, pady=4)
+
+        # MUDANÇA: Checkbox para o Filtro VAD
+        self.chk_vad_filter_var = ctk.BooleanVar(value=True)
+        ctk.CTkCheckBox(self.options_frame,
+                        text="Ativar VAD Filter (Desative para transcrever músicas barulhentas)",
+                        variable=self.chk_vad_filter_var).pack(anchor="w", padx=22, pady=4)
 
         # 3. BOTÕES DE ENTRADA
         self.buttons_frame = ctk.CTkFrame(self.main_frame, fg_color="transparent")
@@ -415,11 +425,12 @@ class AudioBatchUI(ctk.CTk):
         selected_mode = self.censor_mode_var.get()
         save_orig = self.chk_save_orig_var.get()
         save_trans = self.chk_save_trans_var.get()
+        use_vad = self.chk_vad_filter_var.get()  # MUDANÇA: Captura o estado do novo checkbox
 
         threading.Thread(
             target=process_audio,
             args=(audio_array, proc_rate, subtype, is_file, save_path, self.safe_ui_update,
-                  current_threshold, selected_mode, save_orig, save_trans),
+                  current_threshold, selected_mode, save_orig, save_trans, use_vad),
             daemon=True
         ).start()
 
