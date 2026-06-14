@@ -1,6 +1,7 @@
 import os
 import string
 import transformers
+from toxic_synonyms import TOXIC_SYNONYMS
 
 transformers.logging.set_verbosity_error()
 os.environ["TORCH_LOAD_IS_SAFE"] = "True"
@@ -11,18 +12,26 @@ from transformers import pipeline
 
 class ToxicCensor:
     def __init__(self, threshold=0.5, device=0):
-        # Mantemos o carregamento do RoBERTa pronto para o futuro Modo 3
-        print("🤬 [ToxicCensor] Carregando ToxicRoBERTa (Unbiased) via PR na GPU...")
-        self.classifier = pipeline(
-            "text-classification", 
-            model="unitary/unbiased-toxic-roberta",
-            revision="refs/pr/4", 
-            top_k=None, 
-            device=device,
-            use_safetensors=True
-        )
         self.threshold = threshold
-        print("✅ [ToxicCensor] Modelo carregado e pronto!")
+        self.device = device
+        self.classifier = None # Começamos vazio para poupar VRAM!
+        
+        print("🟢 [ToxicCensor] Inicializado com Dicionário Rígido.")
+        print("   (Modelo RoBERTa em espera. Só será carregado no Modo 3)")
+
+    def _load_roberta_if_needed(self):
+        """Gatilho de Lazy Loading: Só roda quando estritamente necessário."""
+        if self.classifier is None:
+            print("🤬 [ToxicCensor] Carregando ToxicRoBERTa (Unbiased) na GPU...")
+            self.classifier = pipeline(
+                "text-classification", 
+                model="unitary/unbiased-toxic-roberta",
+                revision="refs/pr/4", 
+                top_k=None, 
+                device=self.device,
+                use_safetensors=True
+            )
+            print("✅ [ToxicCensor] RoBERTa carregado e pronto!")
 
     def detect_toxic_words(self, words_list, mode="beep"):
         """
@@ -32,12 +41,14 @@ class ToxicCensor:
             return []
             
         intervals_to_censor = []
-        from toxic_synonyms import TOXIC_SYNONYMS
 
         # ================================================================
         # MODO 3 (ESQUELETO): Reescrita Contextual (IA de Frase Inteira)
         # ================================================================
         if mode == "rewrite":
+            # O gatilho é acionado aqui!
+            self._load_roberta_if_needed()
+            
             full_text = " ".join([w["word"] for w in words_list]).strip()
             if not full_text: return []
             
@@ -48,8 +59,7 @@ class ToxicCensor:
             sentence_is_toxic = any(scores_dict.get(label, 0) > self.threshold for label in target_labels)
             
             if sentence_is_toxic:
-                # TODO: Implementar lógica de passagem para o LLM aqui no futuro
-                # Por enquanto, retorna vazio para não quebrar
+                # TODO: Implementar lógica de passagem para o LLM reescrever a frase.
                 pass 
                 
             return intervals_to_censor
@@ -58,6 +68,7 @@ class ToxicCensor:
         # MODOS 1 e 2: Bip e Clonagem (Apenas Dicionário Rígido)
         # ================================================================
         for w_info in words_list:
+            # Limpa as pontuações e espaçamentos grudados na palavra
             clean_word = w_info["word"].strip(string.punctuation + " \t\n\r")
             lower_word = clean_word.lower()
             
@@ -66,7 +77,7 @@ class ToxicCensor:
                 
             if lower_word in TOXIC_SYNONYMS:
                 # Se for bip, passamos None para o AudioCensor saber que deve bipar.
-                # Se for clone, passamos o sinônimo.
+                # Se for clone, passamos o sinônimo da lista.
                 replacement = TOXIC_SYNONYMS[lower_word] if mode == "clone" else None
                 
                 intervals_to_censor.append({

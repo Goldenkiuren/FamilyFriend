@@ -45,57 +45,29 @@ class AudioCensor:
         return trimmed_audio
 
     def _insert_with_crossfade(self, original_audio, new_audio, start_idx, end_idx, fade_samples=1024):
+        """ Crossfade de Potência Constante (Equal Power) para evitar 'pulos' de volume """
         before = original_audio[:start_idx].copy()
         after = original_audio[end_idx:].copy()
         
+        linear = np.linspace(0, 1, fade_samples, dtype=np.float32)
+        
         if len(new_audio) > fade_samples * 2:
-            fade_in = np.linspace(0, 1, fade_samples, dtype=np.float32)
-            fade_out = np.linspace(1, 0, fade_samples, dtype=np.float32)
+            fade_in = np.sin((np.pi / 2) * linear)
+            fade_out = np.cos((np.pi / 2) * linear)
             new_audio[:fade_samples] *= fade_in
             new_audio[-fade_samples:] *= fade_out
             
         if len(before) > fade_samples:
-            before[-fade_samples:] *= np.linspace(1, 0, fade_samples, dtype=np.float32)
+            before[-fade_samples:] *= np.cos((np.pi / 2) * linear)
         if len(after) > fade_samples:
-            after[:fade_samples] *= np.linspace(0, 1, fade_samples, dtype=np.float32)
+            after[:fade_samples] *= np.sin((np.pi / 2) * linear)
 
         result = np.concatenate([before, new_audio, after])
         size_diff = len(new_audio) - (end_idx - start_idx)
         return result, size_diff
 
-    def _find_dynamic_silence(self, audio_array, start_idx, direction="forward", max_search_sec=1.0, window_ms=20, threshold=0.015):
-        # Proteção contra busca nula (quando palavras estão coladas)
-        if max_search_sec <= 0.01:
-            return start_idx
-
-        max_search_samples = int(max_search_sec * self.sample_rate)
-        window_samples = int((window_ms / 1000.0) * self.sample_rate)
-        
-        if direction == "forward":
-            search_area = audio_array[start_idx : start_idx + max_search_samples]
-        else: 
-            search_area = audio_array[max(0, start_idx - max_search_samples) : start_idx]
-            search_area = search_area[::-1] 
-            
-        if len(search_area) < window_samples:
-            return start_idx
-            
-        for i in range(0, len(search_area) - window_samples, window_samples):
-            window = search_area[i : i + window_samples]
-            rms = np.sqrt(np.mean(window**2))
-            
-            if rms < threshold:
-                offset = i + (window_samples // 2)
-                return start_idx + offset if direction == "forward" else start_idx - offset
-                
-        return start_idx + max_search_samples if direction == "forward" else max(0, start_idx - max_search_samples)
-
     def _get_ultra_precise_boundaries(self, audio_array, whisper_start_idx, whisper_end_idx, search_margin_ms=150, window_ms=10):
-        """
-        Expande a busca para fora dos limites do Whisper e usa uma combinação 
-        de Volume (RMS) e Frequência (ZCR) para achar as bordas exatas da palavra.
-        """
-        # 1. Expandimos a "caixa" do Whisper em 150ms para trás e para frente
+        """ Usado no Modo Bip: RMS + ZCR para envolver cirurgicamente apenas a palavra """
         margin_samples = int((search_margin_ms / 1000.0) * self.sample_rate)
         start_search = max(0, whisper_start_idx - margin_samples)
         end_search = min(len(audio_array), whisper_end_idx + margin_samples)
@@ -106,42 +78,71 @@ class AudioCensor:
         if len(segment) < window_samples:
             return whisper_start_idx, whisper_end_idx
 
-        rms_values = []
-        zcr_values = []
+        rms_values, zcr_values = [], []
 
-        # 2. Varredura Acústica
         for i in range(0, len(segment) - window_samples, window_samples):
             window = segment[i : i + window_samples]
-            
-            # Volume (RMS) - Capta o núcleo da palavra (vogais)
             rms = np.sqrt(np.mean(window**2))
             rms_values.append(rms)
-            
-            # Frequência (ZCR) - Capta as consoantes secas (s, sh, f, k)
             zero_crossings = np.sum(np.abs(np.diff(np.signbit(window))))
             zcr_values.append(zero_crossings)
 
-        # 3. Normalização (coloca Volume e Frequência na mesma escala de 0 a 1)
         rms_norm = np.array(rms_values) / (np.max(rms_values) + 1e-6)
         zcr_norm = np.array(zcr_values) / (np.max(zcr_values) + 1e-6)
 
-        # 4. Atividade Combinada (O ZCR tem um peso de 30% para não ser eng Enganado por chiado de fundo)
         activity = rms_norm + (zcr_norm * 0.3)
-
-        # 5. Threshold dinâmico: o som começa quando a atividade atinge 4% do pico máximo daquela região
         threshold = np.max(activity) * 0.04
         valid_indices = [i for i, act in enumerate(activity) if act > threshold]
 
         if not valid_indices:
             return whisper_start_idx, whisper_end_idx 
 
-        # 6. Mapeamento de volta para os índices originais do áudio completo
         tight_start = start_search + (valid_indices[0] * window_samples)
         tight_end = start_search + (valid_indices[-1] * window_samples) + window_samples
 
         return tight_start, tight_end
+
+    def _find_safe_valley(self, audio_array, whisper_sec, limit_sec, is_start_cut=True, window_ms=5):
+        """ 
+        Usado no Modo Clonagem: Acha o vale acústico estritamente limitado pelas 
+        paredes das palavras vizinhas para impedir amputações e efeito gagueira.
+        """
+        base_idx = int(whisper_sec * self.sample_rate)
+        limit_idx = int(limit_sec * self.sample_rate)
+
+        margin_samples = int(0.15 * self.sample_rate)
+        
+        if is_start_cut:
+            search_start = max(limit_idx, base_idx - margin_samples)
+            search_end = min(len(audio_array), base_idx + int(0.05 * self.sample_rate))
+        else:
+            search_start = max(0, base_idx - int(0.05 * self.sample_rate))
+            search_end = min(limit_idx, base_idx + margin_samples)
+            
+        if search_start >= search_end:
+            return base_idx
+            
+        search_area = audio_array[search_start:search_end]
+        window_samples = int((window_ms / 1000.0) * self.sample_rate)
+        
+        if len(search_area) < window_samples:
+            return base_idx
+            
+        rms_values = []
+        step = max(1, window_samples // 2)
+        for i in range(0, len(search_area) - window_samples, step):
+            window = search_area[i : i + window_samples]
+            rms = np.sqrt(np.mean(window**2))
+            rms_values.append((rms, i))
+            
+        if not rms_values:
+            return base_idx
+            
+        min_rms, min_i = min(rms_values, key=lambda x: x[0])
+        return search_start + min_i + (window_samples // 2)
     
     def process_chunk(self, audio_chunk, toxic_intervals, is_first_chunk=False):
+        """ Motor de Censura Pontual (Bip) """
         censored_chunk = audio_chunk.copy()
         chunk_duration = len(audio_chunk) / self.sample_rate
         
@@ -149,12 +150,10 @@ class AudioCensor:
             raw_start_idx = int(max(0.0, interval["start"]) * self.sample_rate)
             raw_end_idx = int(min(chunk_duration, interval["end"]) * self.sample_rate)
             
-            # Chama a análise combinada de RMS e ZCR
             tight_start_idx, tight_end_idx = self._get_ultra_precise_boundaries(
                 audio_chunk, raw_start_idx, raw_end_idx
             )
             
-            # A micro margem agora pode ser ainda menor, apenas 10ms (Crossfade suave)
             micro_margin = int(0.01 * self.sample_rate)
             final_start_idx = max(0, tight_start_idx - micro_margin)
             final_end_idx = min(len(censored_chunk), tight_end_idx + micro_margin)
@@ -173,17 +172,13 @@ class AudioCensor:
         return censored_chunk
 
     def _build_replacement_phrases(self, words_list, toxic_intervals, pause_threshold=0.5, max_duration=9.0):
-        """
-        Agrupa palavras em 'blocos de respiração' (frases).
-        FORÇA a quebra se a frase atingir o max_duration (9 segundos) para evitar o erro 'clipping short' do F5-TTS.
-        """
+        """ Motor de Agrupamento Lógico para a IA (Extrai as Paredes Vizinhas) """
         phrases_to_replace = []
         if not words_list or not toxic_intervals:
             return phrases_to_replace
 
         current_phrase_words = []
         current_toxic_replacements = {} 
-
         toxic_map = {round(t["start"], 2): t for t in toxic_intervals}
 
         for i, w in enumerate(words_list):
@@ -194,8 +189,6 @@ class AudioCensor:
                 current_toxic_replacements[i] = toxic_map[start_time_rounded].get("replacement", "bleep")
 
             current_phrase_words.append((i, w))
-            
-            # Calcula o tamanho da frase atual em segundos
             current_duration = w["end"] - current_phrase_words[0][1]["start"]
 
             is_last_word = (i == len(words_list) - 1)
@@ -204,11 +197,8 @@ class AudioCensor:
             if not is_last_word:
                 next_w = words_list[i+1]
                 gap = next_w["start"] - w["end"]
-                
                 clean_word = w["word"].strip()
                 punctuation_break = clean_word.endswith(('.', '!', '?'))
-                
-                # A NOVA TRAVA: Se passar de 9 segundos, forçamos o corte imediatamente!
                 if gap > pause_threshold or punctuation_break or current_duration >= max_duration:
                     break_phrase = True
 
@@ -220,40 +210,27 @@ class AudioCensor:
                     start_time = current_phrase_words[0][1]["start"]
                     end_time = current_phrase_words[-1][1]["end"]
 
-                    # Caixa de contenção segura (Safe Bounding Box)
-                    first_word_idx = current_phrase_words[0][0]
-                    last_word_idx = current_phrase_words[-1][0]
+                    first_idx = current_phrase_words[0][0]
+                    last_idx = current_phrase_words[-1][0]
 
-                    safe_start = max(0.0, start_time - 0.15)
-                    safe_end = end_time + 0.25
-                    
-                    if first_word_idx > 0:
-                        prev_word_end = words_list[first_word_idx - 1]["end"]
-                        safe_start = max(prev_word_end, safe_start)
-
-                    if last_word_idx < len(words_list) - 1:
-                        next_word_start = words_list[last_word_idx + 1]["start"]
-                        safe_end = min(next_word_start, safe_end)
+                    prev_end = words_list[first_idx - 1]["end"] if first_idx > 0 else 0.0
+                    next_start = words_list[last_idx + 1]["start"] if last_idx < len(words_list) - 1 else end_time + 1.0
 
                     for idx, word_info in current_phrase_words:
                         clean_w = word_info["word"].strip()
                         ref_words.append(clean_w)
-                        
                         if idx in current_toxic_replacements:
                             gen_words.append(current_toxic_replacements[idx])
                         else:
                             gen_words.append(clean_w)
 
-                    ref_text = " ".join(ref_words).strip()
-                    gen_text = " ".join(gen_words).strip()
-
                     phrases_to_replace.append({
                         "start": start_time,
                         "end": end_time,
-                        "safe_start": safe_start,
-                        "safe_end": safe_end,
-                        "ref_text": ref_text,
-                        "gen_text": gen_text
+                        "prev_end": prev_end,         
+                        "next_start": next_start,     
+                        "ref_text": " ".join(ref_words).strip(),
+                        "gen_text": " ".join(gen_words).strip()
                     })
 
                 current_phrase_words = []
@@ -262,48 +239,31 @@ class AudioCensor:
         return phrases_to_replace
 
     def process_offline_replacement(self, full_audio, toxic_intervals, words_list, voice_cloner):
-        print("🔧 [DSP] Iniciando reconstrução de áudio baseada em Nível de Frase...")
-        full_original_text = " ".join([w["word"].strip() for w in words_list])
-        print("="*60)
-        print(f"📜 [TRANSCRIÇÃO ORIGINAL COMPLETA]:\n{full_original_text}")
-        print("="*60)
+        """ Motor Principal do Modo Clone (Processamento Reverso e Edição) """
+        print("🔧 [DSP] Iniciando reconstrução com busca de Vale Acústico Seguro...")
         final_audio = full_audio.copy()
-        accumulated_offset = 0
 
         phrases_to_replace = self._build_replacement_phrases(
             words_list=words_list, 
-            toxic_intervals=toxic_intervals,
-            pause_threshold=0.5
+            toxic_intervals=toxic_intervals
         )
 
-        for phrase in phrases_to_replace:
-            whisper_start_idx = int(phrase["start"] * self.sample_rate)
-            whisper_end_idx = int(phrase["end"] * self.sample_rate)
-            
-            # Forçamos a busca do silêncio a obedecer à caixa de segurança
-            max_back_sec = max(0.0, phrase["start"] - phrase["safe_start"])
-            max_fwd_sec = max(0.0, phrase["safe_end"] - phrase["end"])
-            
-            orig_start_idx = self._find_dynamic_silence(
-                full_audio, whisper_start_idx, direction="backward", max_search_sec=max_back_sec
+        for phrase in reversed(phrases_to_replace):
+            start_idx = self._find_safe_valley(
+                full_audio, whisper_sec=phrase["start"], limit_sec=phrase["prev_end"], is_start_cut=True
             )
-            orig_end_idx = self._find_dynamic_silence(
-                full_audio, whisper_end_idx, direction="forward", max_search_sec=max_fwd_sec
+            end_idx = self._find_safe_valley(
+                full_audio, whisper_sec=phrase["end"], limit_sec=phrase["next_start"], is_start_cut=False
             )
-            
-            start_idx = orig_start_idx + accumulated_offset
-            end_idx = orig_end_idx + accumulated_offset
             
             start_idx = max(0, min(start_idx, len(final_audio)))
             end_idx = max(0, min(end_idx, len(final_audio)))
 
-            reference_audio = full_audio[orig_start_idx:orig_end_idx]
+            reference_audio = full_audio[start_idx:end_idx]
             ref_text = phrase["ref_text"]
             gen_text = phrase["gen_text"]
 
-            print(f"\n🎙️ Clonando frase inteira:")
-            print(f"   Original: '{ref_text}'")
-            print(f"   Censurado: '{gen_text}'")
+            print(f"\n🎙️ Clonando: Original: '{ref_text}' -> Gen: '{gen_text}'")
             
             try:
                 generated_phrase_array = voice_cloner.generate_replacement(
@@ -314,7 +274,7 @@ class AudioCensor:
                 
                 processed_phrase = self._trim_and_normalize(generated_phrase_array, reference_audio)
                 
-                final_audio, size_diff = self._insert_with_crossfade(
+                final_audio, _ = self._insert_with_crossfade(
                     original_audio=final_audio, 
                     new_audio=processed_phrase, 
                     start_idx=start_idx, 
@@ -322,15 +282,16 @@ class AudioCensor:
                     fade_samples=1024
                 )
                 
-                accumulated_offset += size_diff
-                print(f"✅ Frase substituída. (Deslocamento: {size_diff} amostras).")
-                
             except Exception as e:
-                print(f"⚠️ Erro ao clonar frase '{ref_text}'. Aplicando Bip de fallback. Erro: {e}")
-                
-                duration = (orig_end_idx - orig_start_idx) / self.sample_rate
+                print(f"⚠️ Erro ao clonar: {e}")
+                duration = (end_idx - start_idx) / self.sample_rate
                 beep = self._generate_beep(duration)
-                final_audio, size_diff = self._insert_with_crossfade(final_audio, beep, start_idx, end_idx)
-                accumulated_offset += size_diff
+                final_audio, _ = self._insert_with_crossfade(
+                    original_audio=final_audio, 
+                    new_audio=beep, 
+                    start_idx=start_idx, 
+                    end_idx=end_idx,
+                    fade_samples=1024
+                )
 
         return final_audio
