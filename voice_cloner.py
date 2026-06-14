@@ -23,7 +23,8 @@ class VoiceCloner:
         print("✅ [VoiceCloner] F5-TTS pronto para síntese Zero-Shot!")
 
     def generate_replacement(self, reference_audio_array, ref_text, text_to_say,
-                             nfe_step=48, cfg_strength=2.0, remove_silence=False, target_rms=0.1):
+                             nfe_step=48, cfg_strength=2.0, remove_silence=False, target_rms=0.1,
+                             speed=1.0):
         """
         Gera a frase-portadora (carrier) usando a voz original do falante.
         - reference_audio_array: Áudio de referência LIMPO do falante (NumPy 16kHz).
@@ -52,6 +53,7 @@ class VoiceCloner:
                 cfg_strength=cfg_strength,
                 remove_silence=remove_silence,
                 target_rms=target_rms,
+                speed=speed,
                 show_info=lambda *a, **k: None,
             )
             
