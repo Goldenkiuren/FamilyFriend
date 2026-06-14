@@ -27,17 +27,23 @@ class AudioCensor:
         gain = float(min(max(target_rms / cur, min_gain), max_gain))
         return (segment * gain).astype(np.float32)
 
-    def _trim_edges(self, audio, rel_threshold=0.02):
-        """Remove silêncio residual nas bordas do áudio gerado pelo F5."""
+    def _trim_edges(self, audio, lead_thr=0.02, tail_thr=0.006, margin_ms=35):
+        """Remove silêncio nas bordas do áudio gerado, mas com limiar mais BAIXO no fim
+        (+ margem) para NÃO comer sílabas finais fracas (ex.: '-er' de 'Hatcher')."""
         if len(audio) == 0:
             return audio
-        peak = np.max(np.abs(audio))
+        a = np.abs(audio)
+        peak = float(np.max(a))
         if peak < 1e-4:
             return audio
-        non_silent = np.where(np.abs(audio) > rel_threshold * peak)[0]
-        if len(non_silent) == 0:
+        lead = np.where(a > lead_thr * peak)[0]
+        tail = np.where(a > tail_thr * peak)[0]
+        if len(lead) == 0 or len(tail) == 0:
             return audio
-        return audio[non_silent[0]:non_silent[-1] + 1]
+        margin = int((margin_ms / 1000.0) * self.sample_rate)
+        start = max(0, lead[0] - margin)
+        end = min(len(audio), tail[-1] + 1 + margin)
+        return audio[start:end]
 
     def _generate_beep(self, duration):
         t = np.linspace(0, duration, int(self.sample_rate * duration), False)
@@ -150,6 +156,39 @@ class AudioCensor:
 
         min_rms, min_i = min(rms_values, key=lambda x: x[0])
         return search_start + min_i + (window_samples // 2)
+
+    def _find_phrase_end_cut(self, audio, word_end_sec, next_start_sec,
+                             search_ahead=0.40, sustain_ms=40, rel_thr=0.08):
+        """Coloca o corte FINAL no início do silêncio DEPOIS da última palavra (não no
+        meio dela), evitando deixar a cauda da palavra original tocando após a frase gerada.
+        Procura, a partir do pico de energia, o ponto onde a energia cai e PERMANECE baixa."""
+        sr = self.sample_rate
+        base = int(word_end_sec * sr)
+        lo = max(0, base - int(0.05 * sr))
+        hi = min(len(audio), int(next_start_sec * sr), base + int(search_ahead * sr))
+        win = max(1, int(0.01 * sr))
+        step = max(1, win // 2)
+        if hi - lo < 2 * win:
+            return min(base, len(audio))
+
+        pos, rms = [], []
+        i = lo
+        while i < hi - win:
+            pos.append(i + win // 2)
+            rms.append(self._rms(audio[i:i + win]))
+            i += step
+        rms = np.array(rms)
+        peak = float(rms.max())
+        if peak < 1e-6:
+            return pos[0]
+
+        pk = int(np.argmax(rms))
+        thr = rel_thr * peak
+        sustain = max(1, int((sustain_ms / 1000.0) * sr / step))
+        for j in range(pk, len(rms) - sustain):
+            if np.all(rms[j:j + sustain] < thr):
+                return pos[j]
+        return pos[int(np.argmin(rms))]
 
     # ==========================================================
     # MODO 1: BIP
@@ -298,8 +337,8 @@ class AudioCensor:
             start_idx = self._find_safe_valley(
                 full_audio, whisper_sec=phrase["start"], limit_sec=phrase["prev_end"], is_start_cut=True
             )
-            end_idx = self._find_safe_valley(
-                full_audio, whisper_sec=phrase["end"], limit_sec=phrase["next_start"], is_start_cut=False
+            end_idx = self._find_phrase_end_cut(
+                full_audio, word_end_sec=phrase["end"], next_start_sec=phrase["next_start"]
             )
             start_idx = max(0, min(start_idx, len(final_audio)))
             end_idx = max(start_idx, min(end_idx, len(final_audio)))
