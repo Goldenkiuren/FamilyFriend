@@ -1,7 +1,6 @@
 import numpy as np
 import string
 import difflib
-import librosa
 
 def _norm(token):
     """Normaliza um token para casamento de texto (minúsculo, sem pontuação)."""
@@ -107,43 +106,31 @@ class AudioCensor:
             end_idx = min(len(audio), int(w_end_sec * self.sample_rate))
         return start_idx, end_idx
 
-    def _time_fit(self, audio, target_len, keep_lo=0.8, keep_hi=1.25, clamp_lo=0.6, clamp_hi=1.8):
-        """Ajusta levemente a duração da palavra gerada ao slot original, preservando o pitch.
-        Mantém o comprimento natural quando a diferença é pequena (mais natural que esticar)."""
-        cur = len(audio)
-        if cur == 0 or target_len <= 0:
-            return audio
-        rate = cur / target_len  # rate > 1 => acelera (encurta)
-        if keep_lo <= rate <= keep_hi:
-            return audio
-        rate = float(min(max(rate, clamp_lo), clamp_hi))
-        try:
-            stretched = librosa.effects.time_stretch(audio.astype(np.float32), rate=rate)
-            return stretched.astype(np.float32)
-        except Exception:
-            return audio
+    def _crossfade(self, a, b, fade_samples):
+        """Overlap-add de potência constante entre dois trechos (sem buracos/cliques)."""
+        a = np.asarray(a, dtype=np.float32)
+        b = np.asarray(b, dtype=np.float32)
+        if len(a) == 0:
+            return b.copy()
+        if len(b) == 0:
+            return a.copy()
+        f = int(min(fade_samples, len(a), len(b)))
+        if f <= 0:
+            return np.concatenate([a, b])
+        ramp = np.linspace(0.0, 1.0, f, dtype=np.float32)
+        fin = np.sin(0.5 * np.pi * ramp)
+        fout = np.cos(0.5 * np.pi * ramp)
+        mid = a[-f:] * fout + b[:f] * fin
+        return np.concatenate([a[:-f], mid, b[f:]]).astype(np.float32)
 
-    def _insert_with_crossfade(self, original_audio, new_audio, start_idx, end_idx, fade_samples=1024):
-        """ Crossfade de Potência Constante (Equal Power) para evitar 'pulos' de volume """
-        before = original_audio[:start_idx].copy()
-        after = original_audio[end_idx:].copy()
-        
-        linear = np.linspace(0, 1, fade_samples, dtype=np.float32)
-        
-        if len(new_audio) > fade_samples * 2:
-            fade_in = np.sin((np.pi / 2) * linear)
-            fade_out = np.cos((np.pi / 2) * linear)
-            new_audio[:fade_samples] *= fade_in
-            new_audio[-fade_samples:] *= fade_out
-            
-        if len(before) > fade_samples:
-            before[-fade_samples:] *= np.cos((np.pi / 2) * linear)
-        if len(after) > fade_samples:
-            after[:fade_samples] *= np.sin((np.pi / 2) * linear)
-
-        result = np.concatenate([before, new_audio, after])
-        size_diff = len(new_audio) - (end_idx - start_idx)
-        return result, size_diff
+    def _splice_replace(self, audio, insert, start_idx, end_idx, fade_samples=256):
+        """Substitui audio[start:end] por `insert` no comprimento NATURAL do insert
+        (a linha do tempo estica/encolhe conforme necessário) com crossfade curto nas bordas."""
+        before = audio[:start_idx]
+        after = audio[end_idx:]
+        out = self._crossfade(before, insert, fade_samples)
+        out = self._crossfade(out, after, fade_samples)
+        return out
 
     def _get_ultra_precise_boundaries(self, audio_array, whisper_start_idx, whisper_end_idx, search_margin_ms=150, window_ms=10):
         """ Usado no Modo Bip: RMS + ZCR para envolver cirurgicamente apenas a palavra """
@@ -365,8 +352,7 @@ class AudioCensor:
         if duration <= 0:
             return final_audio
         beep = self._generate_beep(duration)
-        new_audio, _ = self._insert_with_crossfade(final_audio, beep, start_idx, end_idx, fade_samples=512)
-        return new_audio
+        return self._splice_replace(final_audio, beep, start_idx, end_idx, fade_samples=256)
 
     def process_offline_replacement(self, full_audio, toxic_intervals, words_list, voice_cloner,
                                     whisper_model=None):
@@ -438,32 +424,41 @@ class AudioCensor:
                 s_sec, e_sec = self._locate_in_carrier(
                     phrase["gen_tokens"], carrier_words, rep["tok_start"], rep["tok_len"], carrier_dur
                 )
-                g_s = max(0, int(s_sec * sr))
-                g_e = min(len(carrier_audio), int(e_sec * sr))
-                gen_word = self._trim_edges(carrier_audio[g_s:g_e])
+                # Padding nas bordas para não cortar consoantes de ataque/final (ex.: /f/, /s/)
+                pad = int(0.045 * sr)
+                g_s = max(0, int(s_sec * sr) - pad)
+                g_e = min(len(carrier_audio), int(e_sec * sr) + pad)
+                gen_word = carrier_audio[g_s:g_e].astype(np.float32).copy()
 
                 if len(gen_word) < int(0.02 * sr):
                     final_audio = self._beep_into(final_audio, start_idx, end_idx)
                     continue
 
-                # Nível: casa o loudness com o contexto vizinho original
-                ctx = np.concatenate([
-                    full_audio[max(0, start_idx - int(0.3 * sr)):start_idx],
-                    full_audio[end_idx:end_idx + int(0.3 * sr)],
-                ])
-                target_rms = self._rms(ctx) if len(ctx) else self._rms(full_audio)
-                gen_word = self._match_rms(gen_word, target_rms)
+                # Nível: casa o loudness com o da palavra ORIGINAL que está sendo trocada
+                # (a região da palavra é fala; usar os silêncios vizinhos deixaria baixo demais).
+                ow_s = int(rep["orig_start"] * sr)
+                ow_e = int(rep["orig_end"] * sr)
+                target_rms = self._rms(full_audio[ow_s:ow_e])
+                if target_rms < 1e-5:
+                    target_rms = self._rms(full_audio)
+                gen_word = self._match_rms(gen_word, target_rms, max_gain=4.0)
 
-                # Duração: ajuste leve ao slot (preserva ritmo sem soar esticado)
-                gen_word = self._time_fit(gen_word, slot_len)
-                np.clip(gen_word, -0.99, 0.99, out=gen_word)
+                # Sem time-stretch: mantém a palavra no comprimento natural (a linha do tempo
+                # acomoda a diferença). Apenas limita picos para não estourar.
+                peak = float(np.max(np.abs(gen_word))) if len(gen_word) else 0.0
+                if peak > 0.99:
+                    gen_word *= (0.99 / peak)
 
                 print(f"   ↳ '{rep['syn_text']}' encaixado "
-                      f"({slot_len/sr:.2f}s slot / {len(gen_word)/sr:.2f}s gerado)")
+                      f"({slot_len/sr:.2f}s slot / {len(gen_word)/sr:.2f}s gerado, natural)")
 
-                final_audio, _ = self._insert_with_crossfade(
-                    original_audio=final_audio, new_audio=gen_word,
-                    start_idx=start_idx, end_idx=end_idx, fade_samples=512,
+                final_audio = self._splice_replace(
+                    final_audio, gen_word, start_idx, end_idx, fade_samples=256
                 )
+
+        # Limitador de segurança: garante que nada estoure após os crossfades
+        peak = float(np.max(np.abs(final_audio))) if len(final_audio) else 0.0
+        if peak > 0.99:
+            final_audio = (final_audio * (0.99 / peak)).astype(np.float32)
 
         return final_audio
