@@ -90,24 +90,83 @@ class AudioCensor:
                 
         return start_idx + max_search_samples if direction == "forward" else max(0, start_idx - max_search_samples)
 
+    def _get_ultra_precise_boundaries(self, audio_array, whisper_start_idx, whisper_end_idx, search_margin_ms=150, window_ms=10):
+        """
+        Expande a busca para fora dos limites do Whisper e usa uma combinação 
+        de Volume (RMS) e Frequência (ZCR) para achar as bordas exatas da palavra.
+        """
+        # 1. Expandimos a "caixa" do Whisper em 150ms para trás e para frente
+        margin_samples = int((search_margin_ms / 1000.0) * self.sample_rate)
+        start_search = max(0, whisper_start_idx - margin_samples)
+        end_search = min(len(audio_array), whisper_end_idx + margin_samples)
+
+        segment = audio_array[start_search:end_search]
+        window_samples = int((window_ms / 1000.0) * self.sample_rate)
+
+        if len(segment) < window_samples:
+            return whisper_start_idx, whisper_end_idx
+
+        rms_values = []
+        zcr_values = []
+
+        # 2. Varredura Acústica
+        for i in range(0, len(segment) - window_samples, window_samples):
+            window = segment[i : i + window_samples]
+            
+            # Volume (RMS) - Capta o núcleo da palavra (vogais)
+            rms = np.sqrt(np.mean(window**2))
+            rms_values.append(rms)
+            
+            # Frequência (ZCR) - Capta as consoantes secas (s, sh, f, k)
+            zero_crossings = np.sum(np.abs(np.diff(np.signbit(window))))
+            zcr_values.append(zero_crossings)
+
+        # 3. Normalização (coloca Volume e Frequência na mesma escala de 0 a 1)
+        rms_norm = np.array(rms_values) / (np.max(rms_values) + 1e-6)
+        zcr_norm = np.array(zcr_values) / (np.max(zcr_values) + 1e-6)
+
+        # 4. Atividade Combinada (O ZCR tem um peso de 30% para não ser eng Enganado por chiado de fundo)
+        activity = rms_norm + (zcr_norm * 0.3)
+
+        # 5. Threshold dinâmico: o som começa quando a atividade atinge 4% do pico máximo daquela região
+        threshold = np.max(activity) * 0.04
+        valid_indices = [i for i, act in enumerate(activity) if act > threshold]
+
+        if not valid_indices:
+            return whisper_start_idx, whisper_end_idx 
+
+        # 6. Mapeamento de volta para os índices originais do áudio completo
+        tight_start = start_search + (valid_indices[0] * window_samples)
+        tight_end = start_search + (valid_indices[-1] * window_samples) + window_samples
+
+        return tight_start, tight_end
+    
     def process_chunk(self, audio_chunk, toxic_intervals, is_first_chunk=False):
         censored_chunk = audio_chunk.copy()
         chunk_duration = len(audio_chunk) / self.sample_rate
         
         for interval in toxic_intervals:
-            start_time = max(0.0, interval["start"] - self.beep_margin_start)
-            end_time = min(chunk_duration, interval["end"] + self.beep_margin_end)
+            raw_start_idx = int(max(0.0, interval["start"]) * self.sample_rate)
+            raw_end_idx = int(min(chunk_duration, interval["end"]) * self.sample_rate)
             
-            if start_time >= end_time:
+            # Chama a análise combinada de RMS e ZCR
+            tight_start_idx, tight_end_idx = self._get_ultra_precise_boundaries(
+                audio_chunk, raw_start_idx, raw_end_idx
+            )
+            
+            # A micro margem agora pode ser ainda menor, apenas 10ms (Crossfade suave)
+            micro_margin = int(0.01 * self.sample_rate)
+            final_start_idx = max(0, tight_start_idx - micro_margin)
+            final_end_idx = min(len(censored_chunk), tight_end_idx + micro_margin)
+            
+            duration = (final_end_idx - final_start_idx) / self.sample_rate
+            
+            if duration <= 0:
                 continue
                 
-            start_idx = int(start_time * self.sample_rate)
-            end_idx = int(end_time * self.sample_rate)
-            duration = end_time - start_time
-            
             beep = self._generate_beep(duration)
-            max_len = min(len(beep), end_idx - start_idx)
-            censored_chunk[start_idx:start_idx+max_len] = beep[:max_len]
+            max_len = min(len(beep), final_end_idx - final_start_idx)
+            censored_chunk[final_start_idx:final_start_idx+max_len] = beep[:max_len]
             
         if not is_first_chunk:
             return censored_chunk[self.overlap_samples:]
