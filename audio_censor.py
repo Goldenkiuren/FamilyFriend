@@ -260,6 +260,7 @@ class AudioCensor:
 
             if break_phrase:
                 if current_toxic_replacements:
+                    ref_words = []
                     gen_words = []
 
                     start_time = current_phrase_words[0][1]["start"]
@@ -273,6 +274,7 @@ class AudioCensor:
 
                     for idx, word_info in current_phrase_words:
                         clean_w = word_info["word"].strip()
+                        ref_words.append(clean_w)
                         if idx in current_toxic_replacements:
                             gen_words.append(current_toxic_replacements[idx])
                         else:
@@ -285,6 +287,7 @@ class AudioCensor:
                         "end": end_time,
                         "prev_end": prev_end,
                         "next_start": next_start,
+                        "ref_text": " ".join(ref_words).strip(),
                         "gen_text": " ".join(gen_words).strip(),
                     })
 
@@ -293,41 +296,13 @@ class AudioCensor:
 
         return phrases_to_replace
 
-    def _build_long_reference(self, full_audio, words_list, first_idx, last_idx,
-                              min_sec=3.0, max_sec=10.0, turn_gap=0.8):
-        """Monta uma referência de voz LONGA (>= min_sec) para o F5 clonar bem.
-        Parte da própria frase e expande para os vizinhos do MESMO turno de fala
-        (pausas <= turn_gap), o que evita pegar o outro locutor sem diarização."""
-        n = len(words_list)
-        lo, hi = first_idx, last_idx
-
-        def span_sec():
-            return words_list[hi]["end"] - words_list[lo]["start"]
-
-        # Expande alternadamente para os lados enquanto for curto e mesmo turno
-        while span_sec() < min_sec and span_sec() < max_sec:
-            grew = False
-            if lo > 0 and (words_list[lo]["start"] - words_list[lo - 1]["end"]) <= turn_gap:
-                lo -= 1
-                grew = True
-            if span_sec() < min_sec and hi < n - 1 and (words_list[hi + 1]["start"] - words_list[hi]["end"]) <= turn_gap:
-                hi += 1
-                grew = True
-            if not grew:
-                break
-
-        s = int(words_list[lo]["start"] * self.sample_rate)
-        e = int(words_list[hi]["end"] * self.sample_rate)
-        ref_audio = full_audio[max(0, s):min(len(full_audio), e)]
-        ref_text = " ".join(words_list[i]["word"].strip() for i in range(lo, hi + 1)).strip()
-        return ref_audio, ref_text
-
     def process_offline_replacement(self, full_audio, toxic_intervals, words_list, voice_cloner,
                                     whisper_model=None):
         """Substitui cada FRASE com palavrão por uma versão regerada pelo F5 (frase inteira,
-        contínua => intel. e ambiência consistentes), usando uma referência de voz longa do
-        mesmo locutor. Boundaries em vales de pausa; nível casado; crossfade equal-power."""
-        print("🔧 [DSP] Modo Clone: regeração por frase com referência longa do mesmo locutor...")
+        contínua => intel. e ambiência consistentes). A REFERÊNCIA é o áudio da própria frase:
+        isso casa a taxa de fala do F5 com a original (sem acelerar nem deslocar palavras).
+        Boundaries em vales de pausa; nível casado; crossfade equal-power."""
+        print("🔧 [DSP] Modo Clone: regeração por frase (referência = áudio da própria frase)...")
         final_audio = full_audio.copy()
         sr = self.sample_rate
 
@@ -345,15 +320,13 @@ class AudioCensor:
             if end_idx - start_idx <= 0:
                 continue
 
-            ref_audio, ref_text = self._build_long_reference(
-                full_audio, words_list, phrase["first_idx"], phrase["last_idx"]
-            )
+            # Referência = a própria frase (o que mantinha a fala estável e na velocidade certa)
+            ref_audio = full_audio[start_idx:end_idx]
+            ref_text = phrase["ref_text"]
             gen_text = phrase["gen_text"]
             ref_sec = len(ref_audio) / sr
 
-            print(f"\n🎙️ Clonando frase -> '{gen_text}'  (ref {ref_sec:.1f}s: '{ref_text[:60]}...')")
-            if ref_sec < 1.0:
-                print("   ⚠️ Referência curta (<1s): o turno é curto; a clonagem pode sair fraca.")
+            print(f"\n🎙️ Clonando frase: '{ref_text}' -> '{gen_text}'  (ref {ref_sec:.1f}s)")
 
             try:
                 generated = voice_cloner.generate_replacement(
