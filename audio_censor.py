@@ -326,13 +326,21 @@ class AudioCensor:
             gen_text = phrase["gen_text"]
             ref_sec = len(ref_audio) / sr
 
-            print(f"\n🎙️ Clonando frase: '{ref_text}' -> '{gen_text}'  (ref {ref_sec:.1f}s)")
+            # Correção de aceleração: o F5 dimensiona a duração pela CONTAGEM DE CARACTERES.
+            # Sinônimo mais curto que o palavrão => menos tempo p/ ~as mesmas palavras => acelera.
+            # Reduzimos o 'speed' nessa proporção (apenas desacelera), com piso p/ não esticar demais.
+            ref_chars = max(1, len(ref_text.encode("utf-8")))
+            gen_chars = max(1, len(gen_text.encode("utf-8")))
+            speed = float(min(1.0, max(0.82, gen_chars / ref_chars)))
+
+            print(f"\n🎙️ Clonando frase: '{ref_text}' -> '{gen_text}'  (ref {ref_sec:.1f}s, speed {speed:.2f})")
 
             try:
                 generated = voice_cloner.generate_replacement(
                     reference_audio_array=ref_audio,
                     ref_text=ref_text,
                     text_to_say=gen_text,
+                    speed=speed,
                 )
                 generated = self._trim_edges(generated)
                 if len(generated) < int(0.05 * sr):
