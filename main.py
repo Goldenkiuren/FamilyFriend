@@ -117,15 +117,23 @@ def process_audio(proc_audio, proc_rate, subtype, is_file, save_path, ui_callbac
         offline_censor = AudioCensor(sample_rate=proc_rate, overlap_duration=0.0)
 
         base_dir = os.path.dirname(save_path)
-        base_name = os.path.splitext(os.path.basename(save_path))[0]
-
-        # 2. Cópia do original: só faz sentido para gravações do microfone
-        #    (arquivos carregados já existem no disco -> não duplicamos).
+        # Extrai o nome base e a extensão que o usuário escolheu
+        base_name, ext = os.path.splitext(os.path.basename(save_path))
+        if not ext:
+            ext = ".wav"  # Fallback de segurança
+            
+        output_folder = os.path.join(base_dir, base_name)
+        os.makedirs(output_folder, exist_ok=True)
+        
+        # 2. Cópia do original (microfone)
         if save_orig and not is_file:
-            orig_path = os.path.join(base_dir, f"{base_name}_original.wav")
-            sf.write(orig_path, proc_audio, proc_rate, subtype=subtype)
+            orig_path = os.path.join(output_folder, f"{base_name}_original{ext}")
+            # Evita usar 'subtype' em formatos comprimidos para não causar erro no soundfile
+            if ext.lower() in [".flac", ".ogg"]:
+                sf.write(orig_path, proc_audio, proc_rate)
+            else:
+                sf.write(orig_path, proc_audio, proc_rate, subtype=subtype)
             ui_callback(msg=f"Cópia original salva: {orig_path}")
-
         # 3. Processamento dos modos
         for mode in modes_to_run:
             if mode == "rewrite":
@@ -151,14 +159,22 @@ def process_audio(proc_audio, proc_rate, subtype, is_file, save_path, ui_callbac
                 )
 
             suffix = "" if len(modes_to_run) == 1 else f"_{mode}"
-            final_save_path = os.path.join(base_dir, f"{base_name}{suffix}.wav")
-            sf.write(final_save_path, final_audio, proc_rate, subtype=subtype)
+            
+            # Atualiza para usar a extensão dinâmica {ext} em vez de .wav
+            final_save_path = os.path.join(output_folder, f"{base_name}{suffix}{ext}")
+            
+            # Salva de forma segura dependendo do formato
+            if ext.lower() in [".flac", ".ogg"]:
+                sf.write(final_save_path, final_audio, proc_rate)
+            else:
+                sf.write(final_save_path, final_audio, proc_rate, subtype=subtype)
+                
             ui_callback(msg=f"Áudio [{mode.upper()}] salvo: {final_save_path}")
 
             # 4. Transcrições (se solicitado)
             if save_transcripts:
                 censored_text = generate_censored_text(words_found, toxic_intervals, mode)
-                txt_path = os.path.join(base_dir, f"{base_name}{suffix}_transcript.txt")
+                txt_path = os.path.join(output_folder, f"{base_name}{suffix}_transcript.txt")   
                 with open(txt_path, "w", encoding="utf-8") as f:
                     f.write(f"=== TRANSCRICAO ORIGINAL ===\n{original_text}\n\n")
                     f.write(f"=== TRANSCRICAO CENSURADA ({mode.upper()}) ===\n{censored_text}\n")
@@ -314,8 +330,12 @@ class AudioBatchUI(ctk.CTk):
         save_path = filedialog.asksaveasfilename(
             title="Onde salvar o resultado processado?",
             defaultextension=".wav",
-            initialfile=f"censurado_{os.path.splitext(os.path.basename(file_path))[0]}.wav",
-            filetypes=[("Áudio WAV", "*.wav")]
+            initialfile=f"censurado_{os.path.splitext(os.path.basename(file_path))[0]}",
+            filetypes=[
+                ("Áudio WAV (Sem compressão)", "*.wav"),
+                ("Áudio FLAC (Alta qualidade)", "*.flac"),
+                ("Áudio OGG (Leve)", "*.ogg")
+            ]
         )
         if not save_path:
             self.safe_ui_update(msg="Processamento cancelado (local de salvamento não escolhido).")
@@ -376,7 +396,11 @@ class AudioBatchUI(ctk.CTk):
             save_path = filedialog.asksaveasfilename(
                 title="Salvar gravação censurada",
                 defaultextension=".wav",
-                filetypes=[("Áudio WAV", "*.wav")]
+                filetypes=[
+                    ("Áudio WAV (Sem compressão)", "*.wav"),
+                    ("Áudio FLAC (Alta qualidade)", "*.flac"),
+                    ("Áudio OGG (Leve)", "*.ogg")
+                ]
             )
 
             if save_path:
