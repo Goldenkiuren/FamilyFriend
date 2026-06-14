@@ -121,10 +121,11 @@ def process_audio(full_audio, save_path, ui_callback, threshold_value, selected_
             # Geração de Áudio Censurado
             if mode == "clone":
                 final_audio = offline_censor.process_offline_replacement(
-                    full_audio=full_audio, 
+                    full_audio=full_audio,
                     toxic_intervals=toxic_intervals,
                     words_list=words_found,
-                    voice_cloner=voice_cloner
+                    voice_cloner=voice_cloner,
+                    whisper_model=whisper_model
                 )
             elif mode == "beep":
                 final_audio = offline_censor.process_chunk(

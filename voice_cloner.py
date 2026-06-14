@@ -22,28 +22,37 @@ class VoiceCloner:
         ).to(device)
         print("✅ [VoiceCloner] F5-TTS pronto para síntese Zero-Shot!")
 
-    def generate_replacement(self, reference_audio_array, ref_text, text_to_say):
+    def generate_replacement(self, reference_audio_array, ref_text, text_to_say,
+                             nfe_step=48, cfg_strength=2.0, remove_silence=True, target_rms=0.1):
         """
-        Gera o sinônimo usando a voz original do usuário.
-        - reference_audio_array: O chunk de áudio capturado (NumPy array)
-        - ref_text: A transcrição exata gerada pelo Whisper (obrigatório no F5)
-        - text_to_say: O sinônimo limpo do dicionário
+        Gera a frase-portadora (carrier) usando a voz original do falante.
+        - reference_audio_array: Áudio de referência LIMPO do falante (NumPy 16kHz).
+          Deve ser um trecho longo (idealmente 3-8s) e sem palavrões para clonar bem o timbre.
+        - ref_text: Transcrição exata desse áudio de referência (obrigatório no F5).
+        - text_to_say: A frase completa com o sinônimo no lugar do palavrão (dá contexto/coarticulação).
+        - nfe_step: passos do flow-matching (mais alto = mais qualidade, mais lento). 48 aproveita a 4080.
+        - remove_silence: corta silêncios de borda gerados pelo F5.
         """
         # 1. Cria um arquivo WAV temporário na memória para o modelo ler
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_wav:
             temp_path = temp_wav.name
-            
+
         try:
             # Salva o array de referência no disco na frequência original do sistema
             sf.write(temp_path, reference_audio_array, self.target_rate)
-            
+
             # 2. Inferência Zero-Shot
-            # O modelo lê o áudio, cruza com o ref_text para mapear as frequências da voz, 
+            # O modelo lê o áudio, cruza com o ref_text para mapear as frequências da voz,
             # e sintetiza o texto novo com o mesmo timbre e acústica do ambiente.
             wav_output = self.tts.infer(
                 ref_file=temp_path,
                 ref_text=ref_text,
-                gen_text=text_to_say
+                gen_text=text_to_say,
+                nfe_step=nfe_step,
+                cfg_strength=cfg_strength,
+                remove_silence=remove_silence,
+                target_rms=target_rms,
+                show_info=lambda *a, **k: None,
             )
             
             # Isola o array de áudio (a API pode retornar uma tupla com métricas extras)
