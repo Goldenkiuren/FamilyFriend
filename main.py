@@ -376,7 +376,7 @@ class AudioBatchUI(ctk.CTk):
         # MUDANÇA: Checkbox para o Filtro VAD
         self.chk_vad_filter_var = ctk.BooleanVar(value=True)
         ctk.CTkCheckBox(self.options_frame,
-                        text="Ativar VAD Filter (Desative para transcrever músicas barulhentas)",
+                        text="Ativar VAD Filter (Desative para transcrever áudios barulhentas)",
                         variable=self.chk_vad_filter_var).pack(anchor="w", padx=22, pady=4)
 
         # 3. BOTÕES DE ENTRADA
