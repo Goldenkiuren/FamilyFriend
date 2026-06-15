@@ -43,18 +43,36 @@ class ToxicCensor:
         
         print("🟢 [ToxicCensor] Inicializado com Dicionário Rígido e Filtros Avançados.")
 
-    def _rewrite_with_llm(self, original_text, deterministic=True):
+    def _rewrite_with_llm(self, original_text, prev_text="", next_text="", deterministic=True):
         """Usa o LLM para reescrever a frase, invertendo discursos de ódio.
 
+        prev_text/next_text são as frases vizinhas (apenas leitura) para que a
+        reescrita flua com o que vem antes e depois — NÃO devem ser reescritas.
         deterministic=True usa decodificação gulosa (reproduzível) na primeira
-        tentativa; nas retentativas usamos amostragem para gerar uma saída
-        DIFERENTE da que falhou na verificação."""
+        tentativa; nas retentativas amostramos para gerar uma saída DIFERENTE da
+        que falhou na verificação."""
+        context_block = ""
+        if prev_text or next_text:
+            context_block = (
+                "\n\nSurrounding text, for context ONLY — do NOT rewrite or output these, "
+                "just make your rewrite connect naturally with them:\n"
+                f"[BEFORE]: {prev_text or '(start of recording)'}\n"
+                f"[AFTER]: {next_text or '(end of recording)'}"
+            )
+
         prompt = [
-            {"role": "system", "content": "You are a strict anti-toxicity AI. Your job is to rewrite the user's sentence. If the sentence is racist, hateful, or abusive, you MUST completely invert the hateful meaning into a positive, friendly, or complimentary observation. Do not just remove slurs; destroy the hateful intent. Output ONLY the final rewritten sentence in standard capitalization. No explanations."},
-            {"role": "user", "content": f"Rewrite this: '{original_text}'"}
+            {"role": "system", "content": (
+                "You are a strict anti-toxicity AI. Rewrite ONLY the user's target text. "
+                "If it is racist, hateful, or abusive, you MUST completely invert the hateful "
+                "meaning into a positive, friendly, or complimentary observation. Do not just "
+                "remove slurs; destroy the hateful intent. Make the rewrite flow naturally with "
+                "the BEFORE and AFTER context so the narrative stays coherent. Output ONLY the "
+                "rewritten target text in standard capitalization. No explanations." + context_block
+            )},
+            {"role": "user", "content": f"Rewrite this target text: '{original_text}'"}
         ]
 
-        gen_kwargs = dict(max_new_tokens=80, return_full_text=False)
+        gen_kwargs = dict(max_new_tokens=160, return_full_text=False)
         if deterministic:
             gen_kwargs.update(do_sample=False)
         else:
@@ -107,6 +125,19 @@ class ToxicCensor:
                 worst_peak, worst_scores = peak, scores
         return False, worst_scores
 
+    def _clean_llm_output(self, text):
+        """Remove ruído de formatação que o modelo às vezes adiciona apesar da
+        instrução (rótulos como 'Rewritten:' e aspas externas). Conservador: não
+        tenta corrigir vazamento de contexto, só a sujeira mais comum."""
+        text = text.strip()
+        for label in ("Rewritten:", "Rewrite:", "Output:", "Result:"):
+            if text.lower().startswith(label.lower()):
+                text = text[len(label):].strip()
+                break
+        if len(text) >= 2 and text[0] in "\"'“" and text[-1] in "\"'”":
+            text = text[1:-1].strip()
+        return text
+
     def _apply_dictionary_swap(self, text):
         """Post-pass: troca palavrões residuais do dicionário na saída do LLM."""
         out = []
@@ -115,13 +146,20 @@ class ToxicCensor:
             out.append(TOXIC_SYNONYMS.get(clean, tok))
         return " ".join(out)
 
-    def _rewrite_and_verify(self, original_text, max_attempts=3):
-        """Reescreve, aplica o dicionário na saída e re-verifica com o RoBERTa.
-        Primeira tentativa gulosa; retentativa amostrada; senão, fallback seguro."""
+    def _rewrite_and_verify(self, original_text, prev_text="", next_text="", max_attempts=3):
+        """Reescreve (com contexto vizinho), limpa a saída, aplica o dicionário e
+        re-verifica com o RoBERTa. Primeira tentativa gulosa; retentativas
+        amostradas; senão, fallback seguro."""
         for attempt in range(max_attempts):
-            rewritten = self._rewrite_with_llm(original_text, deterministic=(attempt == 0))
+            rewritten = self._rewrite_with_llm(
+                original_text, prev_text=prev_text, next_text=next_text,
+                deterministic=(attempt == 0)
+            )
+            rewritten = self._clean_llm_output(rewritten)
             rewritten = self._apply_dictionary_swap(rewritten)
 
+            if not rewritten:
+                continue
             still_toxic, scores = self._is_toxic(rewritten)
             if not still_toxic:
                 return rewritten
@@ -171,44 +209,70 @@ class ToxicCensor:
         gc.collect()
         print("🧹 [ToxicCensor] VRAM liberada. Modelos NLP estacionados na RAM.")
 
+    def detect_and_rewrite_phrases(self, phrases_list):
+        """Detecta toxicidade frase a frase (janelas deslizantes), une frases
+        tóxicas CONTÍGUAS numa única região e reescreve cada região UMA vez,
+        passando as frases vizinhas como contexto (apenas leitura) para coerência.
+        Retorna a lista de intervals no formato esperado pelo F5-TTS."""
+        if not phrases_list:
+            return []
+
+        self._load_ai_models_if_needed()
+
+        # 1. Detecção: marca cada frase como tóxica ou não.
+        flags = []
+        for phrase_words in phrases_list:
+            text = " ".join(w["word"] for w in phrase_words).strip()
+            if not text:
+                flags.append(False)
+                continue
+            is_tox, _ = self._is_toxic_windowed(phrase_words)
+            flags.append(is_tox)
+
+        # 2. Coalescência de regiões contíguas + 3. Reescrita contextual.
+        intervals = []
+        n = len(phrases_list)
+        i = 0
+        while i < n:
+            if not flags[i]:
+                i += 1
+                continue
+
+            j = i
+            while j + 1 < n and flags[j + 1]:
+                j += 1
+
+            region_words = [w for k in range(i, j + 1) for w in phrases_list[k]]
+            region_text = " ".join(w["word"] for w in region_words).strip()
+            prev_text = " ".join(w["word"] for w in phrases_list[i - 1]).strip() if i > 0 else ""
+            next_text = " ".join(w["word"] for w in phrases_list[j + 1]).strip() if j + 1 < n else ""
+
+            print(f"⚠️ Região tóxica (frases {i}–{j}). Reescrevendo com contexto vizinho...")
+            rewritten = self._rewrite_and_verify(region_text, prev_text=prev_text, next_text=next_text)
+
+            intervals.append({
+                "start": region_words[0]["start"],
+                "end": region_words[-1]["end"],
+                "word": region_text,
+                "replacement": rewritten,
+                "label": "contextual_rewrite",
+                "score": 1.0,
+            })
+            i = j + 1
+
+        return intervals
+
     def detect_toxic_words(self, words_list, mode="beep"):
         if not words_list:
             return []
-            
+
         intervals_to_censor = []
 
         if mode == "rewrite":
-            self._load_ai_models_if_needed()
-            
-            # Aqui assumimos que `words_list` já representa uma frase coerente
-            # (passada pelo loop de frases no áudio censor)
-            original_full_text = " ".join([w["word"] for w in words_list]).strip()
-            if not original_full_text: return []
-
-            # Detecção: pontua o texto BRUTO (sem pré-troca de dicionário, que
-            # mascararia o sinal de ódio) em janelas deslizantes, para que um
-            # trecho de ódio curto não se dilua numa frase longa.
-            is_toxic, scores_dict = self._is_toxic_windowed(words_list)
-
-            if is_toxic:
-                print(f"⚠️ Toxicidade Detectada! Passando para o LLM. Score: {scores_dict}")
-
-                # Reescreve com contexto total, aplica o dicionário na saída e
-                # re-verifica; se ainda for tóxico, retenta amostrando; senão, fallback.
-                rewritten_text = self._rewrite_and_verify(original_full_text)
-
-                # Embala o resultado no formato esperado pelo F5-TTS
-                # Passamos o intervalo de tempo de toda a frase
-                intervals_to_censor.append({
-                    "start": words_list[0]["start"],
-                    "end": words_list[-1]["end"],
-                    "word": original_full_text,
-                    "replacement": rewritten_text,
-                    "label": "contextual_rewrite",
-                    "score": max(scores_dict.values())
-                })
-                
-            return intervals_to_censor
+            # Detecção por janelas, coalescência de regiões contíguas e reescrita
+            # ciente do contexto ficam centralizadas em detect_and_rewrite_phrases.
+            # Aqui a `words_list` recebida é tratada como uma única frase.
+            return self.detect_and_rewrite_phrases([words_list])
 
 
         # ================================================================

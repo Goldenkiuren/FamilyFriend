@@ -179,13 +179,12 @@ def process_audio(proc_audio, proc_rate, subtype, is_file, save_path, ui_callbac
             if mode == "rewrite":
                 # Agrupa o Whisper em frases para dar contexto semântico à IA
                 phrases_list = offline_censor.group_into_phrases(words_found)
-                toxic_intervals = []
-                
+
                 ui_callback(msg=f"Avaliando {len(phrases_list)} frases estruturais com IA...")
-                for phrase_words in phrases_list:
-                    intervals = toxic_censor.detect_toxic_words(phrase_words, mode="rewrite")
-                    toxic_intervals.extend(intervals)
-                
+                # Detecção por janelas + coalescência de regiões contíguas +
+                # reescrita ciente do contexto vizinho (tudo centralizado).
+                toxic_intervals = toxic_censor.detect_and_rewrite_phrases(phrases_list)
+
                 # Descarrega RoBERTa e LLM para a DDR5, garantindo que o F5-TTS tenha os 16GB livres
                 toxic_censor.offload_models()
                 
