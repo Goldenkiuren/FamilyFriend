@@ -166,10 +166,15 @@ def process_audio(proc_audio, proc_rate, subtype, is_file, save_path, ui_callbac
         offline_censor = AudioCensor(sample_rate=proc_rate, overlap_duration=0.0)
 
         base_dir = os.path.dirname(save_path)
+        
         # Extrai o nome base e a extensão que o usuário escolheu
         base_name, ext = os.path.splitext(os.path.basename(save_path))
-        if not ext:
-            ext = ".wav"  # Fallback de segurança
+        
+        # Se a extensão for um falso-positivo (ex: '.0' de um timecode), corrige
+        valid_extensions = [".wav", ".mp3", ".flac", ".ogg", ".m4a"]
+        if ext.lower() not in valid_extensions:
+            base_name = os.path.basename(save_path) # Devolve o ".0" para o nome do arquivo
+            ext = ".wav"  # Força a extensão padrão de segurança
             
         output_folder = os.path.join(base_dir, base_name)
         os.makedirs(output_folder, exist_ok=True)
