@@ -324,31 +324,11 @@ class AudioCensor:
 
         return phrases_to_replace
 
-    def _trim_trailing_silence(self, audio, thr_ratio=0.02, margin_ms=30):
-        """Remove apenas o silêncio no FIM do clipe, com margem para não cortar a
-        release da última sílaba."""
-        if len(audio) == 0:
-            return audio
-        a = np.abs(audio)
-        peak = float(a.max())
-        if peak < 1e-4:
-            return audio
-        above = np.where(a > thr_ratio * peak)[0]
-        if len(above) == 0:
-            return audio
-        margin = int((margin_ms / 1000.0) * self.sample_rate)
-        end = min(len(audio), above[-1] + 1 + margin)
-        return audio[:end]
-
-    def _capped_region_reference(self, full_audio, words_list, region_start, region_end,
-                                 target_sec=6.0, min_sec=3.0):
+    def _capped_region_reference(self, full_audio, words_list, region_start, region_end, target_sec=6.0):
         """Reescrita: referência = um trecho CURTO do próprio áudio da região
         (mesma ideia do modo Clone, que usa o áudio da própria frase), limitado a
         ~target_sec para NÃO acionar o eco/repetição do F5 com referências longas.
-        Termina na maior PAUSA dentro da janela (respeitando um piso de min_sec),
-        para a referência soar "completa" e o F5 não continuar/ecoar a última
-        palavra; o silêncio final é aparado. O ref_text casa exatamente com o
-        áudio recortado. Retorna (ref_audio, ref_text)."""
+        O ref_text casa exatamente com o áudio recortado. Retorna (ref_audio, ref_text)."""
         sr = self.sample_rate
 
         # Acumula palavras da região até atingir ~target_sec (mantém ref_text
@@ -367,25 +347,10 @@ class AudioCensor:
             e = min(len(full_audio), int(min(region_end, region_start + target_sec) * sr))
             return full_audio[s:e], ""
 
-        # Corta na maior pausa entre palavras, entre os pontos que ainda deixam
-        # >= min_sec de áudio. Se a região for um "run-on" sem pausas reais, o
-        # melhor (menor) gap é escolhido — nunca pior que o recorte cru.
-        best_k, best_gap = None, -1.0
-        for k in range(len(run)):
-            if run[k]["end"] - run[0]["start"] < min_sec:
-                continue
-            nxt = run[k + 1]["start"] if k + 1 < len(run) else region_end
-            gap = nxt - run[k]["end"]
-            if gap > best_gap:
-                best_gap, best_k = gap, k
-        if best_k is not None:
-            run = run[:best_k + 1]
-
         s = max(0, int(run[0]["start"] * sr))
         e = min(len(full_audio), int(run[-1]["end"] * sr))
-        ref_audio = self._trim_trailing_silence(full_audio[s:e])
         ref_text = " ".join(w["word"] for w in run).strip()
-        return ref_audio, ref_text
+        return full_audio[s:e], ref_text
 
     def process_offline_replacement(self, full_audio, toxic_intervals, words_list, voice_cloner,
                                     whisper_model=None):
