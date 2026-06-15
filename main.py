@@ -32,15 +32,15 @@ voice_cloner = None
 # BACKEND & PROCESSAMENTO
 # ==========================================
 
-def load_models_if_needed(ui_callback, threshold_value):
+def load_models_if_needed(ui_callback, thresholds_dict): # Mudou de threshold_value
     global whisper_model, toxic_censor
     if whisper_model is None or toxic_censor is None:
         ui_callback(msg="Carregando modelos na GPU... aguarde.")
         whisper_model = WhisperModel("large-v3", device="cuda", compute_type="float16")
-        toxic_censor = ToxicCensor(threshold=threshold_value)
+        toxic_censor = ToxicCensor(thresholds_dict=thresholds_dict)
         ui_callback(msg="Modelos base prontos.")
     else:
-        toxic_censor.threshold = threshold_value
+        toxic_censor.thresholds_dict = thresholds_dict # Atualiza os limites dinamicamente
 
 
 def pure_record_callback(indata, frames, time_info, status):
@@ -61,35 +61,61 @@ def _to_whisper_audio(proc_audio, proc_rate):
 
 def generate_censored_text(words_list, toxic_intervals, mode):
     """Gera a string do texto censurado com base nos intervalos."""
-    toxic_map = {round(t["start"], 2): t for t in toxic_intervals}
-    censored_words = []
+    if not toxic_intervals:
+        return " ".join([w["word"] for w in words_list])
 
-    for w in words_list:
-        start_round = round(w["start"], 2)
-        if start_round in toxic_map:
-            rep = toxic_map[start_round].get("replacement")
-            if mode == "beep" or rep is None:
-                censored_words.append("[BIP]")
+    censored_words = []
+    
+    if mode == "rewrite":
+        i = 0
+        while i < len(words_list):
+            w = words_list[i]
+            # Verifica se a palavra atual está dentro de um intervalo de reescrita
+            current_interval = None
+            for t in toxic_intervals:
+                # Margem de 0.1s para evitar erros de arredondamento
+                if w["start"] >= t["start"] - 0.1 and w["end"] <= t["end"] + 0.1:
+                    current_interval = t
+                    break
+            
+            if current_interval:
+                # Adiciona a frase reescrita inteira
+                censored_words.append(f"[{current_interval['replacement'].upper()}]")
+                # Avança o índice para pular todas as palavras da frase original
+                while i < len(words_list) and words_list[i]["end"] <= current_interval["end"] + 0.1:
+                    i += 1
             else:
-                censored_words.append(rep.upper())
-        else:
-            censored_words.append(w["word"])
+                censored_words.append(w["word"])
+                i += 1
+    else:
+        # Lógica original para Bip e Clone (palavra por palavra)
+        toxic_map = {round(t["start"], 2): t for t in toxic_intervals}
+        for w in words_list:
+            start_round = round(w["start"], 2)
+            if start_round in toxic_map:
+                rep = toxic_map[start_round].get("replacement")
+                if mode == "beep" or rep is None:
+                    censored_words.append("[BIP]")
+                else:
+                    censored_words.append(rep.upper())
+            else:
+                censored_words.append(w["word"])
 
     return " ".join(censored_words)
 
 
 # MUDANÇA: Adicionado o parâmetro `use_vad` na assinatura da função
 def process_audio(proc_audio, proc_rate, subtype, is_file, save_path, ui_callback,
-                  threshold_value, selected_mode, save_orig, save_transcripts, use_vad):
+                  thresholds_dict, selected_mode, save_orig, save_transcripts, use_vad):
     """Processa o áudio na sua taxa de amostragem NATIVA (preserva qualidade).
     O Whisper recebe uma cópia 16kHz separada; a edição e a saída ficam na taxa original."""
     global whisper_model, toxic_censor, voice_cloner
 
     try:
         ui_callback(msg="Iniciando processamento...")
-        load_models_if_needed(ui_callback, threshold_value)
+        load_models_if_needed(ui_callback, thresholds_dict)
 
-        modes_to_run = ["beep", "clone"] if selected_mode == "all" else [selected_mode]
+        modes_to_run = ["beep", "clone", "rewrite"] if selected_mode == "all" else [selected_mode]
 
         if ("clone" in modes_to_run or "rewrite" in modes_to_run) and voice_cloner is None:
             ui_callback(msg="Carregando motor de clonagem de voz (F5-TTS)...")
@@ -128,27 +154,47 @@ def process_audio(proc_audio, proc_rate, subtype, is_file, save_path, ui_callbac
         output_folder = os.path.join(base_dir, base_name)
         os.makedirs(output_folder, exist_ok=True)
         
+        # Função interna para salvar áudio com fallback de segurança (Garante exportação MP3)
+        def safe_save_audio(filepath, audio_data, rate, extension, stype):
+            try:
+                if extension.lower() in [".flac", ".ogg", ".mp3"]:
+                    sf.write(filepath, audio_data, rate)
+                else:
+                    sf.write(filepath, audio_data, rate, subtype=stype)
+            except Exception as ex:
+                ui_callback(msg=f"⚠️ Soundfile falhou ao gerar {extension}. Usando motor do Torchaudio...")
+                tensor_audio = torch.from_numpy(audio_data).unsqueeze(0)
+                torchaudio.save(filepath, tensor_audio, rate, format=extension.lower().strip("."))
+
         # 2. Cópia do original (microfone)
         if save_orig and not is_file:
             orig_path = os.path.join(output_folder, f"{base_name}_original{ext}")
-            # Evita usar 'subtype' em formatos comprimidos para não causar erro no soundfile
-            if ext.lower() in [".flac", ".ogg"]:
-                sf.write(orig_path, proc_audio, proc_rate)
-            else:
-                sf.write(orig_path, proc_audio, proc_rate, subtype=subtype)
+            safe_save_audio(orig_path, proc_audio, proc_rate, ext, subtype)
             ui_callback(msg=f"Cópia original salva: {orig_path}")
             
         # 3. Processamento dos modos
         for mode in modes_to_run:
-            if mode == "rewrite":
-                ui_callback(msg="Modo de Reescrita Contextual ainda não implementado. Pulando.")
-                continue
-
             ui_callback(msg=f"Analisando toxicidade — modo [{mode.upper()}]...")
-            toxic_intervals = toxic_censor.detect_toxic_words(words_found, mode=mode)
+
+            if mode == "rewrite":
+                # Agrupa o Whisper em frases para dar contexto semântico à IA
+                phrases_list = offline_censor.group_into_phrases(words_found)
+                toxic_intervals = []
+                
+                ui_callback(msg=f"Avaliando {len(phrases_list)} frases estruturais com IA...")
+                for phrase_words in phrases_list:
+                    intervals = toxic_censor.detect_toxic_words(phrase_words, mode="rewrite")
+                    toxic_intervals.extend(intervals)
+                
+                # Descarrega RoBERTa e LLM para a DDR5, garantindo que o F5-TTS tenha os 16GB livres
+                toxic_censor.offload_models()
+                
+            else:
+                toxic_intervals = toxic_censor.detect_toxic_words(words_found, mode=mode)
+                
             ui_callback(msg=f"{len(toxic_intervals)} ocorrência(s) encontrada(s). Editando...")
 
-            if mode == "clone":
+            if mode in ["clone", "rewrite"]:
                 final_audio = offline_censor.process_offline_replacement(
                     full_audio=proc_audio,
                     toxic_intervals=toxic_intervals,
@@ -163,15 +209,10 @@ def process_audio(proc_audio, proc_rate, subtype, is_file, save_path, ui_callbac
                 )
 
             suffix = "" if len(modes_to_run) == 1 else f"_{mode}"
-            
-            # Atualiza para usar a extensão dinâmica {ext} em vez de .wav
             final_save_path = os.path.join(output_folder, f"{base_name}{suffix}{ext}")
             
-            # Salva de forma segura dependendo do formato
-            if ext.lower() in [".flac", ".ogg"]:
-                sf.write(final_save_path, final_audio, proc_rate)
-            else:
-                sf.write(final_save_path, final_audio, proc_rate, subtype=subtype)
+            # Utiliza nossa função segura com fallback
+            safe_save_audio(final_save_path, final_audio, proc_rate, ext, subtype)
                 
             ui_callback(msg=f"Áudio [{mode.upper()}] salvo: {final_save_path}")
 
@@ -204,45 +245,91 @@ class AudioBatchUI(ctk.CTk):
     def __init__(self):
         super().__init__()
         self.title("FamilyFriend AI — Censor de Áudio")
-        self.geometry("920x650") # MUDANÇA: Aumentado levemente para caber o novo botão
+        self.geometry("920x650")
         self.minsize(920, 650)
+
+        os.makedirs("inputs", exist_ok=True)
+        os.makedirs("outputs", exist_ok=True)
 
         self.grid_rowconfigure(0, weight=1)
         self.grid_columnconfigure(1, weight=1)
 
+        self.thresholds = {
+            'toxicity': 1.0,
+            'identity_attack': 0.5,
+            'severe_toxicity': 0.5,
+            'obscene': 0.5,
+            'insult': 0.5,
+            'threat': 0.5,
+            'sexual_explicit': 0.5
+        }
         self._build_sidebar()
         self._build_main_panel()
 
+    # ✅ AGORA SIM dentro da classe
     def _build_sidebar(self):
-        self.sidebar = ctk.CTkFrame(self, width=240, corner_radius=0)
+        self.sidebar = ctk.CTkScrollableFrame(self, width=240, corner_radius=0)
         self.sidebar.grid(row=0, column=0, sticky="nsew")
         self.sidebar.grid_rowconfigure(6, weight=1)
 
         self.logo_label = ctk.CTkLabel(
             self.sidebar, text="FamilyFriend", font=ctk.CTkFont(size=24, weight="bold")
         )
-        self.logo_label.grid(row=0, column=0, padx=20, pady=(32, 4))
+        self.logo_label.pack(padx=20, pady=(32, 4))
 
         self.subtitle_label = ctk.CTkLabel(
             self.sidebar, text="Censor de Áudio por IA",
             font=ctk.CTkFont(size=12), text_color=("gray70", "gray60")
         )
-        self.subtitle_label.grid(row=1, column=0, padx=20, pady=(0, 24))
+        self.subtitle_label.pack(padx=20, pady=(0, 20))
 
-        self.lbl_thresh = ctk.CTkLabel(
-            self.sidebar, text="Sensibilidade (modo Reescrita): 0.50",
-            font=ctk.CTkFont(size=12)
-        )
-        self.lbl_thresh.grid(row=4, column=0, padx=20, pady=(10, 0), sticky="w")
+        ctk.CTkLabel(
+            self.sidebar,
+            text="Filtros Avançados",
+            font=ctk.CTkFont(size=16, weight="bold")
+        ).pack(padx=20, pady=(10, 10), anchor="w")
 
-        self.slider_thresh = ctk.CTkSlider(self.sidebar, from_=0.1, to=0.9, command=self._update_thresh_lbl)
-        self.slider_thresh.set(0.5)
-        self.slider_thresh.grid(row=5, column=0, padx=20, pady=(8, 20))
+        labels_pt = {
+            'toxicity': 'Toxicidade Geral',
+            'identity_attack': 'Ataques de Identidade',
+            'severe_toxicity': 'Toxicidade Severa',
+            'obscene': 'Obscenidade',
+            'insult': 'Insultos',
+            'threat': 'Ameaças',
+            'sexual_explicit': 'Conteúdo Sexual'
+        }
+
+        def update_val(key, val, lbl):
+            self.thresholds[key] = float(val)
+            display_val = "Desativado" if val >= 0.99 else f"{val:.2f}"
+            lbl.configure(text=f"{labels_pt[key]}: {display_val}")
+
+        for key, pt_name in labels_pt.items():
+            frame = ctk.CTkFrame(self.sidebar, fg_color="transparent")
+            frame.pack(fill="x", padx=20, pady=5)
+
+            current_val = self.thresholds[key]
+            display_val = "Desativado" if current_val >= 0.99 else f"{current_val:.2f}"
+
+            lbl = ctk.CTkLabel(frame, text=f"{pt_name}: {display_val}", font=ctk.CTkFont(size=12))
+            lbl.pack(anchor="w")
+
+            slider = ctk.CTkSlider(
+                frame,
+                from_=0.1,
+                to=1.0,
+                number_of_steps=90,
+                command=lambda v, k=key, l=lbl: update_val(k, v, l)
+            )
+            slider.set(current_val)
+            slider.pack(fill="x", pady=(2, 0))
 
         self.version_label = ctk.CTkLabel(
-            self.sidebar, text="v0.1", font=ctk.CTkFont(size=11), text_color=("gray60", "gray50")
+            self.sidebar, text="v0.1",
+            font=ctk.CTkFont(size=11),
+            text_color=("gray60", "gray50")
         )
-        self.version_label.grid(row=7, column=0, padx=20, pady=(0, 16), sticky="s")
+        self.version_label.pack(padx=20, pady=(10, 16), anchor="s")
 
     def _build_main_panel(self):
         self.main_frame = ctk.CTkFrame(self, fg_color="transparent")
@@ -263,9 +350,9 @@ class AudioBatchUI(ctk.CTk):
                            variable=self.censor_mode_var, value="beep").pack(anchor="w", padx=22, pady=4)
         ctk.CTkRadioButton(self.mode_frame, text="2.  Substituir por sinônimo na voz original (F5-TTS)",
                            variable=self.censor_mode_var, value="clone").pack(anchor="w", padx=22, pady=4)
-        ctk.CTkRadioButton(self.mode_frame, text="3.  Reescrita contextual (em breve)",
-                           variable=self.censor_mode_var, value="rewrite", state="disabled").pack(anchor="w", padx=22, pady=4)
-        ctk.CTkRadioButton(self.mode_frame, text="4.  Gerar todas as saídas (modos 1 e 2)",
+        ctk.CTkRadioButton(self.mode_frame, text="3.  Reescrita contextual (LLM / RoBERTa)",
+                           variable=self.censor_mode_var, value="rewrite", state="normal").pack(anchor="w", padx=22, pady=4)
+        ctk.CTkRadioButton(self.mode_frame, text="4.  Gerar todas as saídas (modos 1, 2 e 3)",
                            variable=self.censor_mode_var, value="all").pack(anchor="w", padx=22, pady=4)
 
         # 2. OPÇÕES DE SALVAMENTO E FILTROS
@@ -332,6 +419,7 @@ class AudioBatchUI(ctk.CTk):
     def load_audio_file(self):
         file_path = filedialog.askopenfilename(
             title="Selecione um arquivo de áudio",
+            initialdir=os.path.abspath("inputs"),
             filetypes=[("Arquivos de Áudio", "*.wav *.mp3 *.ogg *.flac *.m4a")]
         )
         if not file_path:
@@ -339,10 +427,12 @@ class AudioBatchUI(ctk.CTk):
 
         save_path = filedialog.asksaveasfilename(
             title="Onde salvar o resultado processado?",
+            initialdir=os.path.abspath("outputs"),
             defaultextension=".wav",
             initialfile=f"censurado_{os.path.splitext(os.path.basename(file_path))[0]}",
             filetypes=[
                 ("Áudio WAV (Sem compressão)", "*.wav"),
+                ("Áudio MP3 (Mais compatível)", "*.mp3"),
                 ("Áudio FLAC (Alta qualidade)", "*.flac"),
                 ("Áudio OGG (Leve)", "*.ogg")
             ]
@@ -405,9 +495,11 @@ class AudioBatchUI(ctk.CTk):
 
             save_path = filedialog.asksaveasfilename(
                 title="Salvar gravação censurada",
+                initialdir=os.path.abspath("outputs"),
                 defaultextension=".wav",
                 filetypes=[
                     ("Áudio WAV (Sem compressão)", "*.wav"),
+                    ("Áudio MP3 (Mais compatível)", "*.mp3"),
                     ("Áudio FLAC (Alta qualidade)", "*.flac"),
                     ("Áudio OGG (Leve)", "*.ogg")
                 ]
@@ -419,21 +511,20 @@ class AudioBatchUI(ctk.CTk):
                                               subtype="PCM_16", is_file=False)
             else:
                 self.safe_ui_update(msg="Salvamento cancelado. Áudio descartado.")
-
+    
     def _start_processing_thread(self, audio_array, save_path, proc_rate, subtype, is_file):
-        current_threshold = self.slider_thresh.get()
         selected_mode = self.censor_mode_var.get()
         save_orig = self.chk_save_orig_var.get()
         save_trans = self.chk_save_trans_var.get()
-        use_vad = self.chk_vad_filter_var.get()  # MUDANÇA: Captura o estado do novo checkbox
+        use_vad = self.chk_vad_filter_var.get() 
 
+        # Passamos o dicionário completo em vez do slider_thresh
         threading.Thread(
             target=process_audio,
             args=(audio_array, proc_rate, subtype, is_file, save_path, self.safe_ui_update,
-                  current_threshold, selected_mode, save_orig, save_trans, use_vad),
+                  self.thresholds, selected_mode, save_orig, save_trans, use_vad),
             daemon=True
         ).start()
-
 
 if __name__ == "__main__":
     app = AudioBatchUI()

@@ -941,6 +941,7 @@ name = "familyfriend"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
+    { name = "accelerate" },
     { name = "customtkinter" },
     { name = "f5-tts" },
     { name = "faster-whisper" },
@@ -953,6 +954,7 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
+    { name = "accelerate", specifier = ">=1.13.0" },
     { name = "customtkinter", specifier = ">=5.2.2" },
     { name = "f5-tts", specifier = ">=1.1.20" },
     { name = "faster-whisper", specifier = ">=1.2.1" },

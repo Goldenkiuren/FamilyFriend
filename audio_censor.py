@@ -10,6 +10,34 @@ class AudioCensor:
         self.beep_margin_start = beep_margin_start
         self.beep_margin_end = beep_margin_end
 
+
+    @staticmethod
+    def group_into_phrases(words_list, pause_threshold=0.5, max_duration=9.0):
+        """Agrupa a lista de palavras do Whisper em blocos coerentes (frases puras)."""
+        phrases = []
+        if not words_list: return phrases
+        
+        current_phrase = []
+        for i, w in enumerate(words_list):
+            current_phrase.append(w)
+            current_duration = w["end"] - current_phrase[0]["start"]
+            
+            is_last = (i == len(words_list) - 1)
+            break_phrase = is_last
+            
+            if not is_last:
+                next_w = words_list[i + 1]
+                gap = next_w["start"] - w["end"]
+                clean_word = w["word"].strip()
+                punctuation_break = clean_word.endswith(('.', '!', '?'))
+                if gap > pause_threshold or punctuation_break or current_duration >= max_duration:
+                    break_phrase = True
+
+            if break_phrase:
+                phrases.append(current_phrase)
+                current_phrase = []
+        return phrases
+
     # ==========================================================
     # DSP helpers
     # ==========================================================
@@ -306,7 +334,24 @@ class AudioCensor:
         final_audio = full_audio.copy()
         sr = self.sample_rate
 
-        phrases = self._build_replacement_phrases(words_list, toxic_intervals)
+        if any(t.get("label") == "contextual_rewrite" for t in toxic_intervals):
+            print("📝 Identificado Modo de Reescrita. Aplicando saídas diretas do LLM.")
+            phrases = []
+            for t in toxic_intervals:
+                # Limpa ALL CAPS forçando a primeira letra maiúscula e o resto minúscula
+                clean_replacement = t["replacement"].capitalize() 
+                
+                phrases.append({
+                    "start": t["start"],
+                    "end": t["end"],
+                    "prev_end": max(0, t["start"] - 0.5), # Margem segura 
+                    "next_start": t["end"] + 0.5,
+                    "ref_text": t["word"],
+                    "gen_text": clean_replacement
+                })
+        else:
+            # Comportamento original para o Modo 2 (Clone Dicionário)
+            phrases = self._build_replacement_phrases(words_list, toxic_intervals)
 
         for phrase in reversed(phrases):
             start_idx = self._find_safe_valley(
