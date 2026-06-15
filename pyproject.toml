@@ -15,3 +15,8 @@ dependencies = [
     "soundfile>=0.14.0",
     "transformers>=5.9.0",
 ]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.15.17",
+]

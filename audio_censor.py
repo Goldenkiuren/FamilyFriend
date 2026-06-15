@@ -1,5 +1,4 @@
 import numpy as np
-import string
 
 
 class AudioCensor:
@@ -15,8 +14,9 @@ class AudioCensor:
     def group_into_phrases(words_list, pause_threshold=0.5, max_duration=9.0):
         """Agrupa a lista de palavras do Whisper em blocos coerentes (frases puras)."""
         phrases = []
-        if not words_list: return phrases
-        
+        if not words_list:
+            return phrases
+
         current_phrase = []
         for i, w in enumerate(words_list):
             current_phrase.append(w)

@@ -35,9 +35,23 @@ voice_cloner = None
 def load_models_if_needed(ui_callback, thresholds_dict): # Mudou de threshold_value
     global whisper_model, toxic_censor
     if whisper_model is None or toxic_censor is None:
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                "Nenhuma GPU NVIDIA (CUDA) detectada. Este aplicativo exige uma GPU "
+                "compatível com CUDA para rodar Whisper, RoBERTa, Qwen e F5-TTS; "
+                "execução em CPU não é suportada."
+            )
         ui_callback(msg="Carregando modelos na GPU... aguarde.")
-        whisper_model = WhisperModel("large-v3", device="cuda", compute_type="float16")
-        toxic_censor = ToxicCensor(thresholds_dict=thresholds_dict)
+        try:
+            whisper_model = WhisperModel("large-v3", device="cuda", compute_type="float16")
+            toxic_censor = ToxicCensor(thresholds_dict=thresholds_dict)
+        except Exception as e:
+            whisper_model = None
+            toxic_censor = None
+            raise RuntimeError(
+                f"Falha ao carregar/baixar os modelos base: {e}. O primeiro uso baixa "
+                f"vários GB — verifique a conexão de internet e o espaço em disco."
+            ) from e
         ui_callback(msg="Modelos base prontos.")
     else:
         toxic_censor.thresholds_dict = thresholds_dict # Atualiza os limites dinamicamente
@@ -119,8 +133,14 @@ def process_audio(proc_audio, proc_rate, subtype, is_file, save_path, ui_callbac
 
         if ("clone" in modes_to_run or "rewrite" in modes_to_run) and voice_cloner is None:
             ui_callback(msg="Carregando motor de clonagem de voz (F5-TTS)...")
-            from voice_cloner import VoiceCloner
-            voice_cloner = VoiceCloner()
+            try:
+                from voice_cloner import VoiceCloner
+                voice_cloner = VoiceCloner()
+            except Exception as e:
+                raise RuntimeError(
+                    f"Falha ao carregar/baixar o F5-TTS: {e}. O primeiro uso baixa os "
+                    f"pesos — verifique a conexão de internet e o espaço em disco."
+                ) from e
             ui_callback(msg="Motor de voz carregado.")
 
         start_time = time.time()
@@ -161,7 +181,7 @@ def process_audio(proc_audio, proc_rate, subtype, is_file, save_path, ui_callbac
                     sf.write(filepath, audio_data, rate)
                 else:
                     sf.write(filepath, audio_data, rate, subtype=stype)
-            except Exception as ex:
+            except Exception:
                 ui_callback(msg=f"⚠️ Soundfile falhou ao gerar {extension}. Usando motor do Torchaudio...")
                 tensor_audio = torch.from_numpy(audio_data).unsqueeze(0)
                 torchaudio.save(filepath, tensor_audio, rate, format=extension.lower().strip("."))
@@ -318,7 +338,7 @@ class AudioBatchUI(ctk.CTk):
                 from_=0.1,
                 to=1.0,
                 number_of_steps=90,
-                command=lambda v, k=key, l=lbl: update_val(k, v, l)
+                command=lambda v, k=key, lb=lbl: update_val(k, v, lb)
             )
             slider.set(current_val)
             slider.pack(fill="x", pady=(2, 0))
@@ -401,9 +421,6 @@ class AudioBatchUI(ctk.CTk):
         self.log_console.grid(row=3, column=0, sticky="nsew", pady=(12, 0))
         self.log_console.insert("0.0", "Sistema inicializado.\nCarregue um arquivo ou grave pelo microfone para começar.\n")
         self.log_console.configure(state="disabled")
-
-    def _update_thresh_lbl(self, value):
-        self.lbl_thresh.configure(text=f"Sensibilidade (modo Reescrita): {value:.2f}")
 
     def safe_ui_update(self, msg=None):
         self.after(0, self._apply_ui_updates, msg)
@@ -505,6 +522,9 @@ class AudioBatchUI(ctk.CTk):
             )
 
             if save_path:
+                if not pure_record_buffer:
+                    self.safe_ui_update(msg="Nenhum áudio capturado. Gravação descartada.")
+                    return
                 full_audio = np.concatenate(pure_record_buffer).flatten().astype(np.float32)
                 self._start_processing_thread(full_audio, save_path, proc_rate=MIC_RATE,
                                               subtype="PCM_16", is_file=False)

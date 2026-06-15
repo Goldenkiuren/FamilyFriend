@@ -4,7 +4,7 @@ import transformers
 import gc
 from toxic_synonyms import TOXIC_SYNONYMS
 import torch
-from transformers import pipeline, AutoModelForCausalLM, AutoTokenizer
+from transformers import pipeline
 
 transformers.logging.set_verbosity_error()
 os.environ["TORCH_LOAD_IS_SAFE"] = "True"
