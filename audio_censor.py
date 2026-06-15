@@ -324,6 +324,34 @@ class AudioCensor:
 
         return phrases_to_replace
 
+    def _capped_region_reference(self, full_audio, words_list, region_start, region_end, target_sec=6.0):
+        """Reescrita: referência = um trecho CURTO do próprio áudio da região
+        (mesma ideia do modo Clone, que usa o áudio da própria frase), limitado a
+        ~target_sec para NÃO acionar o eco/repetição do F5 com referências longas.
+        O ref_text casa exatamente com o áudio recortado. Retorna (ref_audio, ref_text)."""
+        sr = self.sample_rate
+
+        # Acumula palavras da região até atingir ~target_sec (mantém ref_text
+        # alinhado às fronteiras reais das palavras no áudio).
+        run = []
+        for w in words_list:
+            if w["end"] <= region_start - 1e-3 or w["start"] >= region_end + 1e-3:
+                continue  # fora da região
+            run.append(w)
+            if run[-1]["end"] - run[0]["start"] >= target_sec:
+                break
+
+        if not run:
+            # Fallback bruto: recorte temporal da região, sem ref_text.
+            s = max(0, int(region_start * sr))
+            e = min(len(full_audio), int(min(region_end, region_start + target_sec) * sr))
+            return full_audio[s:e], ""
+
+        s = max(0, int(run[0]["start"] * sr))
+        e = min(len(full_audio), int(run[-1]["end"] * sr))
+        ref_text = " ".join(w["word"] for w in run).strip()
+        return full_audio[s:e], ref_text
+
     def process_offline_replacement(self, full_audio, toxic_intervals, words_list, voice_cloner,
                                     whisper_model=None):
         """Substitui cada FRASE com palavrão por uma versão regerada pelo F5 (frase inteira,
@@ -344,10 +372,11 @@ class AudioCensor:
                 phrases.append({
                     "start": t["start"],
                     "end": t["end"],
-                    "prev_end": max(0, t["start"] - 0.5), # Margem segura 
+                    "prev_end": max(0, t["start"] - 0.5), # Margem segura
                     "next_start": t["end"] + 0.5,
                     "ref_text": t["word"],
-                    "gen_text": clean_replacement
+                    "gen_text": clean_replacement,
+                    "is_rewrite": True
                 })
         else:
             # Comportamento original para o Modo 2 (Clone Dicionário)
@@ -365,19 +394,29 @@ class AudioCensor:
             if end_idx - start_idx <= 0:
                 continue
 
-            # Referência = a própria frase (o que mantinha a fala estável e na velocidade certa)
-            ref_audio = full_audio[start_idx:end_idx]
-            ref_text = phrase["ref_text"]
             gen_text = phrase["gen_text"]
+
+            if phrase.get("is_rewrite"):
+                # Reescrita: referência = trecho CURTO do próprio áudio da região
+                # (como o Clone), capado p/ evitar o eco/repetição do F5 com
+                # referências longas. Pacing natural; o splice usa o comprimento
+                # natural do áudio gerado.
+                ref_audio, ref_text = self._capped_region_reference(
+                    full_audio, words_list, phrase["start"], phrase["end"]
+                )
+                speed = 1.0
+            else:
+                # Clone (dicionário): referência = a própria frase curta, com
+                # correção de aceleração pela contagem de caracteres.
+                # Sinônimo mais curto que o palavrão => menos tempo => acelera;
+                # reduzimos o 'speed' nessa proporção (só desacelera, com piso).
+                ref_audio = full_audio[start_idx:end_idx]
+                ref_text = phrase["ref_text"]
+                ref_chars = max(1, len(ref_text.encode("utf-8")))
+                gen_chars = max(1, len(gen_text.encode("utf-8")))
+                speed = float(min(1.0, max(0.82, gen_chars / ref_chars)))
+
             ref_sec = len(ref_audio) / sr
-
-            # Correção de aceleração: o F5 dimensiona a duração pela CONTAGEM DE CARACTERES.
-            # Sinônimo mais curto que o palavrão => menos tempo p/ ~as mesmas palavras => acelera.
-            # Reduzimos o 'speed' nessa proporção (apenas desacelera), com piso p/ não esticar demais.
-            ref_chars = max(1, len(ref_text.encode("utf-8")))
-            gen_chars = max(1, len(gen_text.encode("utf-8")))
-            speed = float(min(1.0, max(0.82, gen_chars / ref_chars)))
-
             print(f"\n🎙️ Clonando frase: '{ref_text}' -> '{gen_text}'  (ref {ref_sec:.1f}s, speed {speed:.2f})")
 
             try:
